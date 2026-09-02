@@ -134,7 +134,7 @@ def _resolve_streaming_kv_events_config(
         raise ValueError(f"Unsupported streaming KV event publisher: {publisher!r}")
     endpoint = config.get("endpoint", "tcp://*:5557")
     if not isinstance(endpoint, str) or not endpoint:
-        raise ValueError("Native KV event endpoint must be a non-empty string")
+        raise ValueError("Streaming KV event endpoint must be a non-empty string")
     config["endpoint"] = endpoint
     config.setdefault("topic", "")
     return config

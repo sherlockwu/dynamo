@@ -384,7 +384,7 @@ def test_streaming_kv_events_create_direct_subscribers_without_engine_polling(
     monkeypatch,
 ):
     """Native mode must subscribe to each rank's vLLM wire stream without
-    starting the legacy TRT event-drain thread."""
+    starting the polling event-drain thread."""
     pub, module, _ = _build_publisher_stub(
         monkeypatch, attention_dp_size=2, fpm_enabled=True
     )
