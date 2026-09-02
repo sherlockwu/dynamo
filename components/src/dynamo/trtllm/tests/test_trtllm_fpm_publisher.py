@@ -372,6 +372,7 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
     }
     pub.native_kv_events_gpus_per_node = 1
     monkeypatch.setenv("DYN_TRTLLM_KV_EVENT_HOSTS", "worker01,worker02")
+    monkeypatch.setenv("SLURM_STEP_NODELIST", "wrong[01-02]")
 
     pub.initialize()
 
@@ -386,8 +387,8 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
     assert pub.publish_kv_cache_events_thread is None
 
 
-def test_native_kv_events_require_explicit_hosts_for_multinode(monkeypatch):
-    """Multi-node discovery must fail without the explicit launcher contract."""
+def test_native_kv_events_fall_back_to_slurm_hosts_for_multinode(monkeypatch):
+    """Slurm allocation metadata remains supported without explicit hosts."""
     pub, _module, _ = _build_publisher_stub(
         monkeypatch, attention_dp_size=2, fpm_enabled=True
     )
@@ -397,8 +398,33 @@ def test_native_kv_events_require_explicit_hosts_for_multinode(monkeypatch):
     }
     pub.native_kv_events_gpus_per_node = 1
     monkeypatch.delenv("DYN_TRTLLM_KV_EVENT_HOSTS", raising=False)
+    monkeypatch.setenv("SLURM_STEP_NODELIST", "worker[01-02]")
 
-    with pytest.raises(RuntimeError, match="DYN_TRTLLM_KV_EVENT_HOSTS"):
+    pub.initialize()
+
+    calls = publisher_mod.KvEventPublisher.call_args_list
+    assert [call.kwargs["zmq_endpoint"] for call in calls] == [
+        "tcp://worker01:5557",
+        "tcp://worker02:5558",
+    ]
+
+
+def test_native_kv_events_require_hosts_for_multinode(monkeypatch):
+    """Multi-node discovery must fail without explicit or Slurm host metadata."""
+    pub, _module, _ = _build_publisher_stub(
+        monkeypatch, attention_dp_size=2, fpm_enabled=True
+    )
+    pub.native_kv_events_config = {
+        "endpoint": "tcp://*:5557",
+        "topic": "",
+    }
+    pub.native_kv_events_gpus_per_node = 1
+    monkeypatch.delenv("DYN_TRTLLM_KV_EVENT_HOSTS", raising=False)
+    monkeypatch.delenv("SLURM_STEP_NODELIST", raising=False)
+
+    with pytest.raises(
+        RuntimeError, match="DYN_TRTLLM_KV_EVENT_HOSTS.*SLURM_STEP_NODELIST"
+    ):
         pub.initialize()
 
 
