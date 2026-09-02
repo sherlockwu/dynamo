@@ -23,7 +23,7 @@ use dynamo_protocols::types::{
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
-    CreateChatCompletionRequest, FunctionName, FunctionObject, FunctionType,
+    CreateChatCompletionRequest, FinishReason, FunctionName, FunctionObject, FunctionType,
     ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent,
     ReasoningEffort as ChatReasoningEffort, ResponseFormat, ServiceTier as ChatServiceTier,
 };
@@ -1028,6 +1028,19 @@ pub struct ResponseParams {
     pub safety_identifier: Option<String>,
 }
 
+/// Map a terminal Chat Completions reason that makes a Responses result non-success-like.
+/// The Responses protocol has no content-filter status, so preserve the failure semantics
+/// with an incomplete response and a reason clients can inspect.
+pub(crate) fn responses_incomplete_reason(
+    finish_reason: Option<FinishReason>,
+) -> Option<&'static str> {
+    match finish_reason {
+        Some(FinishReason::Length) => Some("max_output_tokens"),
+        Some(FinishReason::ContentFilter) => Some("content_filter"),
+        _ => None,
+    }
+}
+
 impl ResponseParams {
     fn reasoning_summary_requested(&self) -> bool {
         self.reasoning
@@ -1134,11 +1147,10 @@ pub fn chat_completion_to_response(
 
     let choice = chat_resp.choices.into_iter().next();
     let mut output = Vec::new();
-    let mut output_limit_reached = false;
+    let mut incomplete_reason = None;
 
     if let Some(choice) = choice {
-        output_limit_reached =
-            choice.finish_reason == Some(dynamo_protocols::types::FinishReason::Length);
+        incomplete_reason = responses_incomplete_reason(choice.finish_reason);
 
         if let Some(reasoning_text) = choice.message.reasoning_content
             && !reasoning_text.is_empty()
@@ -1229,12 +1241,12 @@ pub fn chat_completion_to_response(
     }
 
     let created_at = chat_resp.created as u64;
-    let status = if output_limit_reached {
+    let status = if incomplete_reason.is_some() {
         Status::Incomplete
     } else {
         Status::Completed
     };
-    if output_limit_reached {
+    if incomplete_reason.is_some() {
         // The budget runs out once, inside the item the model was still writing.
         // Earlier output items were complete and must not be relabelled.
         let terminal = output
@@ -1259,7 +1271,7 @@ pub fn chat_completion_to_response(
         id: response_id,
         object: "response".to_string(),
         created_at,
-        completed_at: (!output_limit_reached).then_some(created_at),
+        completed_at: incomplete_reason.is_none().then_some(created_at),
         model: if chat_resp.model == "unknown" {
             params.model.clone().unwrap_or(chat_resp.model)
         } else {
@@ -1293,8 +1305,8 @@ pub fn chat_completion_to_response(
         billing: None,
         conversation: None,
         error: None,
-        incomplete_details: output_limit_reached.then(|| IncompleteDetails {
-            reason: "max_output_tokens".to_string(),
+        incomplete_details: incomplete_reason.map(|reason| IncompleteDetails {
+            reason: reason.to_string(),
         }),
         instructions: params.instructions.clone().map(Instructions::Text),
         max_output_tokens: params.max_output_tokens,
@@ -3569,6 +3581,32 @@ thinking
             panic!("expected function call output");
         };
         assert_eq!(call.status, Some(OutputStatus::Completed));
+    }
+
+    #[test]
+    fn test_content_filter_returns_non_success_response() {
+        let chat_resp = make_chat_resp_with_text("blocked");
+        let mut chat_resp = chat_resp;
+        chat_resp.inner.choices[0].finish_reason =
+            Some(dynamo_protocols::types::FinishReason::ContentFilter);
+
+        let response =
+            chat_completion_to_response(chat_resp, &ResponseParams::default(), None).unwrap();
+
+        assert_eq!(response.inner.status, Status::Incomplete);
+        assert_eq!(response.inner.completed_at, None);
+        assert_eq!(
+            response
+                .inner
+                .incomplete_details
+                .as_ref()
+                .map(|details| details.reason.as_str()),
+            Some("content_filter")
+        );
+        let OutputItem::Message(message) = &response.inner.output[0] else {
+            panic!("expected message output");
+        };
+        assert_eq!(message.status, OutputStatus::Incomplete);
     }
 
     #[test]

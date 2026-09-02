@@ -181,14 +181,30 @@ impl AnthropicStreamConverter {
         // Only the token limit cuts a call short, and it does so once, in the last
         // call. This mirrors `chat_completion_to_anthropic_response`.
         let truncated = self.stop_reason == Some(AnthropicStopReason::MaxTokens);
-        let ready: Vec<&ToolCallState> = self
-            .tool_call_states
-            .iter()
-            .filter(|tool_call| tool_call.is_emit_ready())
-            .collect();
-        let last_call = ready.len().saturating_sub(1);
+        // Use the highest observed call index before filtering out calls whose identity
+        // never completed. An argument-only later call is still the terminal observed
+        // call and must not make an earlier ready call look like the truncation target.
+        let last_call = self.tool_call_states.len().checked_sub(1);
 
-        for (call_index, tool_call) in ready.into_iter().enumerate() {
+        for (call_index, tool_call) in self.tool_call_states.iter().enumerate() {
+            if !tool_call.is_emit_ready() {
+                continue;
+            }
+
+            let raw: String = tool_call
+                .argument_fragments
+                .iter()
+                .map(|(arguments, _)| arguments.as_str())
+                .collect();
+            let arguments_are_valid =
+                raw.is_empty() || serde_json::from_str::<serde_json::Value>(&raw).is_ok();
+            let repair = truncated && Some(call_index) == last_call && !arguments_are_valid;
+            let repaired_input = repair
+                .then(|| super::types::tool_use_input(&tool_call.name, &raw, true))
+                .flatten();
+            if repair && repaired_input.is_none() {
+                continue;
+            }
             let emitted_id = new_tool_use_id();
             tracing::debug!(
                 backend_id = %tool_call.backend_id,
@@ -208,17 +224,7 @@ impl AnthropicStreamConverter {
                 None,
             ));
 
-            let raw: String = tool_call
-                .argument_fragments
-                .iter()
-                .map(|(arguments, _)| arguments.as_str())
-                .collect();
-            let repair = truncated
-                && call_index == last_call
-                && serde_json::from_str::<serde_json::Value>(&raw).is_err();
-
-            if repair {
-                let input = super::types::tool_use_input(&tool_call.name, &raw, true);
+            if let Some(input) = repaired_input {
                 events.push((
                     "content_block_delta",
                     AnthropicStreamEvent::ContentBlockDelta {
@@ -1483,6 +1489,36 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&inputs[1].1).unwrap(),
             serde_json::json!({"done": "no"})
         );
+    }
+
+    #[test]
+    fn test_later_incomplete_identity_does_not_repair_an_earlier_call() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("first"),
+            Some(r#"{"done": "cut""#),
+        ));
+        conv.process_chunk_tagged(&tool_call_chunk(1, None, None, Some(r#"{"later": "args""#)));
+
+        let mut events = conv.process_chunk_tagged(&finish_chunk(FinishReason::Length));
+        events.extend(conv.emit_end_events_tagged());
+
+        assert!(events.iter().all(|event| !matches!(
+            &event.data,
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::InputJsonDelta { partial_json },
+                ..
+            } if partial_json.contains("done") && partial_json.contains('}')
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::InputJsonDelta { partial_json },
+                ..
+            } if partial_json == r#"{"done": "cut""#
+        )));
     }
 
     /// Buffered tool-argument fragments must carry the usage snapshot from their

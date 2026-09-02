@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use dynamo_protocols::types::{ChatCompletionMessageContent, FinishReason};
 
-use super::ResponseParams;
+use super::{ResponseParams, responses_incomplete_reason};
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
 use crate::protocols::unified::ResponsesContext;
 
@@ -66,8 +66,8 @@ pub struct ResponseStreamConverter {
     next_output_index: u32,
     // Usage stats from the backend's final chunk
     usage: Option<ResponseUsage>,
-    // The backend exhausted the output budget.
-    output_limit_reached: bool,
+    // The backend ended with a terminal reason that is not success-like.
+    incomplete_reason: Option<&'static str>,
 }
 
 struct FunctionCallState {
@@ -115,7 +115,7 @@ impl ResponseStreamConverter {
             function_call_items: Vec::new(),
             next_output_index: 0,
             usage: None,
-            output_limit_reached: false,
+            incomplete_reason: None,
         }
     }
 
@@ -132,7 +132,6 @@ impl ResponseStreamConverter {
     }
 
     fn make_response(&self, status: Status, output: Vec<OutputItem>) -> Response {
-        let is_incomplete = status == Status::Incomplete;
         let completed_at = if status == Status::Completed {
             Some(
                 SystemTime::now()
@@ -178,8 +177,8 @@ impl ResponseStreamConverter {
             billing: None,
             conversation: None,
             error: None,
-            incomplete_details: is_incomplete.then(|| IncompleteDetails {
-                reason: "max_output_tokens".to_string(),
+            incomplete_details: self.incomplete_reason.map(|reason| IncompleteDetails {
+                reason: reason.to_string(),
             }),
             instructions: self.params.instructions.clone().map(Instructions::Text),
             max_output_tokens: self.params.max_output_tokens,
@@ -263,8 +262,8 @@ impl ResponseStreamConverter {
         for choice in &chunk.inner.choices {
             let delta = &choice.delta;
 
-            if choice.finish_reason == Some(FinishReason::Length) {
-                self.output_limit_reached = true;
+            if let Some(reason) = responses_incomplete_reason(choice.finish_reason) {
+                self.incomplete_reason = Some(reason);
             }
 
             if let Some(reasoning) = delta.reasoning_content.as_deref()
@@ -649,7 +648,7 @@ impl ResponseStreamConverter {
     }
 
     fn output_status(&self) -> OutputStatus {
-        if self.output_limit_reached {
+        if self.incomplete_reason.is_some() {
             OutputStatus::Incomplete
         } else {
             OutputStatus::Completed
@@ -665,7 +664,7 @@ impl ResponseStreamConverter {
     }
 
     fn item_output_status(&self, output_index: u32) -> OutputStatus {
-        if self.output_limit_reached && Some(output_index) == self.terminal_output_index() {
+        if self.incomplete_reason.is_some() && Some(output_index) == self.terminal_output_index() {
             OutputStatus::Incomplete
         } else {
             OutputStatus::Completed
@@ -673,7 +672,7 @@ impl ResponseStreamConverter {
     }
 
     fn terminal_status(&self) -> Status {
-        if self.output_limit_reached {
+        if self.incomplete_reason.is_some() {
             Status::Incomplete
         } else {
             Status::Completed
@@ -1495,6 +1494,35 @@ mod tests {
             Some("max_output_tokens")
         );
         assert_eq!(response.completed_at, None);
+        let OutputItem::Message(message) = &response.output[0] else {
+            panic!("expected message output");
+        };
+        assert_eq!(message.status, OutputStatus::Incomplete);
+    }
+
+    #[test]
+    fn test_content_filter_emits_incomplete_terminal_response() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.process_chunk(&with_finish_reason(
+            text_chunk("blocked"),
+            FinishReason::ContentFilter,
+        ));
+
+        let end_events = conv.emit_end_events();
+        assert_eq!(
+            event_types(&end_events).last().map(String::as_str),
+            Some("response.incomplete")
+        );
+
+        let response = conv.make_response(conv.terminal_status(), conv.completed_output());
+        assert_eq!(response.status, Status::Incomplete);
+        assert_eq!(
+            response
+                .incomplete_details
+                .as_ref()
+                .map(|details| details.reason.as_str()),
+            Some("content_filter")
+        );
         let OutputItem::Message(message) = &response.output[0] else {
             panic!("expected message output");
         };

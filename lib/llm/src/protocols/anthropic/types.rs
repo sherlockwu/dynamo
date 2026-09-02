@@ -574,9 +574,13 @@ pub(super) fn tool_use_input(
     tool_name: &str,
     arguments: &str,
     truncated: bool,
-) -> serde_json::Value {
+) -> Option<serde_json::Value> {
+    if arguments.is_empty() {
+        return Some(serde_json::json!({}));
+    }
+
     let error = match serde_json::from_str::<serde_json::Value>(arguments) {
-        Ok(value) => return value,
+        Ok(value) => return Some(value),
         Err(error) => error,
     };
 
@@ -585,11 +589,9 @@ pub(super) fn tool_use_input(
             tool_name = %tool_name,
             argument_bytes = arguments.len(),
             error = %error,
-            "tool call arguments are not valid JSON and generation was not cut off; emitting \
-             an empty tool_use input rather than a partial one, because the response claims \
-             this call completed"
+            "suppressing tool_use block with invalid arguments because generation was not cut off"
         );
-        return serde_json::json!({});
+        return None;
     }
 
     match recover_completed_members(arguments) {
@@ -602,17 +604,16 @@ pub(super) fn tool_use_input(
                 "tool call arguments were cut off at the token limit; keeping the members \
                  that completed. `stop_reason` is `max_tokens`"
             );
-            serde_json::Value::Object(map)
+            Some(serde_json::Value::Object(map))
         }
         None => {
             tracing::warn!(
                 tool_name = %tool_name,
                 argument_bytes = arguments.len(),
                 error = %error,
-                "tool call arguments were cut off at the token limit and no complete member \
-                 survived; emitting an empty tool_use input"
+                "suppressing truncated tool_use block because no complete member survived"
             );
-            serde_json::json!({})
+            None
         }
     }
 }
@@ -726,11 +727,13 @@ pub fn chat_completion_to_anthropic_response(
         if let Some(tool_calls) = choice.message.tool_calls {
             let last_call = tool_calls.len().saturating_sub(1);
             for (call_index, tc) in tool_calls.into_iter().enumerate() {
-                let input = tool_use_input(
+                let Some(input) = tool_use_input(
                     &tc.function.name,
                     &tc.function.arguments,
                     truncated && call_index == last_call,
-                );
+                ) else {
+                    continue;
+                };
                 let emitted_id = new_tool_use_id();
                 tracing::debug!(
                     backend_id = %tc.id,
@@ -2549,9 +2552,8 @@ mod anthropic_types_tests {
             dynamo_protocols::types::FinishReason::Length,
             &[MALFORMED_BUT_COMPLETE, TRUNCATED],
         );
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0], serde_json::json!({}));
-        assert_eq!(inputs[1], serde_json::json!({"label": "customer-eof"}));
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0], serde_json::json!({"label": "customer-eof"}));
     }
 
     #[test]
@@ -2563,17 +2565,14 @@ mod anthropic_types_tests {
             dynamo_protocols::types::FinishReason::FunctionCall,
         ] {
             let inputs = converted_tool_use_inputs(reason, &[TRUNCATED]);
-            assert_eq!(
-                inputs,
-                vec![serde_json::json!({})],
-                "unexpected recovery for {reason:?}"
-            );
+            assert!(inputs.is_empty(), "unexpected tool block for {reason:?}");
         }
     }
 
     #[test]
     fn truncated_arguments_keep_the_members_that_completed() {
-        let input = tool_use_input("record_literal", TRUNCATED, true);
+        let input = tool_use_input("record_literal", TRUNCATED, true)
+            .expect("completed members should be recovered");
         let obj = input.as_object().expect("input must stay an object");
 
         // The finished member survives verbatim.
@@ -2593,17 +2592,19 @@ mod anthropic_types_tests {
     /// received a well-formed tool_use block and executed it with no arguments.
     #[test]
     fn truncated_arguments_are_not_silently_emptied() {
-        assert_ne!(
+        assert_eq!(
             tool_use_input("record_literal", TRUNCATED, true),
-            serde_json::json!({}),
-            "unparseable arguments must not collapse to an empty object"
+            Some(serde_json::json!({"label": "customer-eof"}))
         );
     }
 
     #[test]
     fn valid_arguments_are_passed_through_unchanged() {
         let input = tool_use_input("get_weather", r#"{"location": "SF", "unit": "c"}"#, true);
-        assert_eq!(input, serde_json::json!({"location": "SF", "unit": "c"}));
+        assert_eq!(
+            input,
+            Some(serde_json::json!({"location": "SF", "unit": "c"}))
+        );
     }
 
     #[test]
@@ -2619,7 +2620,7 @@ mod anthropic_types_tests {
     fn final_member_without_closing_brace_is_recovered_when_provably_complete() {
         assert_eq!(
             tool_use_input("record_literal", r#"{"label":"done""#, true),
-            serde_json::json!({"label": "done"})
+            Some(serde_json::json!({"label": "done"}))
         );
         assert_eq!(
             recover_completed_members(r#"{"count": 2 "#).unwrap()["count"],
