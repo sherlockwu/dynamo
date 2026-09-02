@@ -181,6 +181,28 @@ jobs:
           KVBM_MLA_BACKEND: ${{ inputs.kvbm_mla_backend }}
         run: |
           echo "KVBM_MLA_BACKEND=${KVBM_MLA_BACKEND}" >> "$GITHUB_ENV"
+      # Datadog's installer needs `pip` and aborts without it. The dynamo image
+      # runs pytest from /opt/dynamo/venv, whose bin dir isn't on PATH here, so
+      # instrumentation silently never installed. Also ensures ddtrace lands in
+      # the interpreter that runs pytest.
+      - name: Ensure pip is on PATH for Datadog instrumentation
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          if command -v pip >/dev/null 2>&1; then
+            echo "pip already on PATH: $(command -v pip)"
+            exit 0
+          fi
+          for venv in "${VIRTUAL_ENV:-}" /opt/dynamo/venv; do
+            if [ -n "${venv}" ] && [ -x "${venv}/bin/pip" ]; then
+              echo "${venv}/bin" >> "$GITHUB_PATH"
+              echo "added ${venv}/bin to PATH for pip"
+              exit 0
+            fi
+          done
+          echo "::warning title=Datadog::pip not found and no virtualenv located; ddtrace will not install."
+
       # Experimental: trialing Datadog Test Visibility. Remove if not kept.
       - name: Configure Datadog Test Visibility
         continue-on-error: true
