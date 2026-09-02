@@ -199,6 +199,54 @@ fn suppress_tool_call_output(choice: &mut DeltaChoice) {
     }
 }
 
+/// A token-limit finish can interrupt only the final structured call. Keep earlier
+/// calls whose argument strings are valid JSON, but do not expose the incomplete call
+/// as executable structured output. An empty argument string remains valid for a
+/// parameterless tool call because the stream schema permits omitted arguments.
+fn drop_incomplete_length_tool_calls(choice: &mut DeltaChoice) {
+    if choice.finish_reason != Some(dynamo_protocols::types::FinishReason::Length) {
+        return;
+    }
+
+    let Some(tool_calls) = choice.tool_calls.as_mut() else {
+        return;
+    };
+    tool_calls.retain(|tool_call| {
+        let arguments = &tool_call.function.arguments;
+        arguments.is_empty() || serde_json::from_str::<serde_json::Value>(arguments).is_ok()
+    });
+    if tool_calls.is_empty() {
+        choice.tool_calls = None;
+    }
+}
+
+/// A failed structured parse at the output limit is not ordinary assistant prose.
+/// Suppress the incomplete candidate rather than exposing parser markup or a partial
+/// guided-JSON document as `content`. Plain text remains untouched unless the parser
+/// actually identified a structured candidate.
+fn suppress_incomplete_structured_content(
+    choice: &mut DeltaChoice,
+    parser: &str,
+    constraint: &crate::protocols::openai::GuidedToolConstraint,
+) {
+    if choice.finish_reason != Some(dynamo_protocols::types::FinishReason::Length)
+        || choice.text.is_empty()
+    {
+        return;
+    }
+
+    let structured_candidate =
+        constraint.installs_guided_json() || contains_native_tool_call_marker(&choice.text, parser);
+    if structured_candidate {
+        tracing::warn!(
+            parser,
+            recovered_bytes = choice.text.len(),
+            "suppressing incomplete structured tool output on length finish"
+        );
+        choice.text.clear();
+    }
+}
+
 impl Default for DeltaAggregator {
     /// Provides a default implementation for `DeltaAggregator` by calling [`DeltaAggregator::new`].
     fn default() -> Self {
@@ -530,6 +578,11 @@ impl DeltaAggregator {
                     Err(error) => {
                         // Best-effort: the aggregated text is served as-is rather than
                         // failing a request the model already answered.
+                        suppress_incomplete_structured_content(
+                            choice,
+                            family,
+                            &parsing_options.guided_tool_constraint,
+                        );
                         tracing::warn!(
                             error = %error,
                             family,
@@ -661,6 +714,11 @@ impl DeltaAggregator {
                             }
                         }
                         Err(error) => {
+                            suppress_incomplete_structured_content(
+                                choice,
+                                family,
+                                &parsing_options.guided_tool_constraint,
+                            );
                             tracing::debug!(error = %error, family, "muse unified batch parse failed");
                         }
                     }
@@ -677,30 +735,7 @@ impl DeltaAggregator {
                 // parse_complete drops a value truncated at EOF instead of guessing it.
                 // Other families and the flag-off path keep the v1 finalize path.
                 // Guided JSON is handled above from the exact carried constraint.
-                // Extract the truncated tail BEFORE parsing so a second <tool_call>
-                // truncated after a complete first one is not silently dropped.
-                // Token strings come from the parser config so this stays in sync
-                // with any override, and matches the streaming path in preprocessor.rs.
                 let glm47_cfg = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
-                let glm47_truncated_tail = if parser == "glm47"
-                    && matches!(
-                        choice.finish_reason,
-                        Some(dynamo_protocols::types::FinishReason::Length)
-                    ) {
-                    choice
-                        .text
-                        .rfind(glm47_cfg.tool_call_start.as_str())
-                        .and_then(|start| {
-                            let tail = &choice.text[start..];
-                            if !tail.contains(glm47_cfg.tool_call_end.as_str()) {
-                                Some(tail.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                } else {
-                    None
-                };
 
                 let parse_result = parse_complete_tool_output(
                     &choice.text,
@@ -711,6 +746,11 @@ impl DeltaAggregator {
                 let (tool_calls, content) = match parse_result {
                     Ok(result) => result,
                     Err(error) => {
+                        suppress_incomplete_structured_content(
+                            choice,
+                            parser,
+                            &parsing_options.guided_tool_constraint,
+                        );
                         tracing::debug!(
                             error = %error,
                             parser,
@@ -741,27 +781,25 @@ impl DeltaAggregator {
                 {
                     tracing::warn!(
                         parser,
-                        "glm47: partial <tool_call> returned as content on length finish"
+                        "glm47: suppressing partial <tool_call> content on length finish"
                     );
-                }
-
-                // Recover any tail saved before parsing — the parser drops a truncated
-                // second block silently when an earlier complete block was already parsed.
-                if let Some(tail) = glm47_truncated_tail
-                    && !choice.text.contains(&tail)
-                {
-                    tracing::warn!(
-                        parser,
-                        tail_bytes = tail.len(),
-                        "glm47: truncated later <tool_call> appended as content"
-                    );
-                    if choice.text.is_empty() {
-                        choice.text = tail;
-                    } else {
-                        choice.text.push_str(&tail);
+                    if let Some(start) = choice.text.rfind(glm47_cfg.tool_call_start.as_str()) {
+                        choice.text.truncate(start);
                     }
+                } else if choice.finish_reason
+                    == Some(dynamo_protocols::types::FinishReason::Length)
+                {
+                    suppress_incomplete_structured_content(
+                        choice,
+                        parser,
+                        &parsing_options.guided_tool_constraint,
+                    );
                 }
             }
+        }
+
+        for choice in aggregator.choices.values_mut() {
+            drop_incomplete_length_tool_calls(choice);
         }
 
         // A retained whole-response parser may discover a syntactically valid
@@ -2034,6 +2072,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_length_drops_incomplete_structured_tool_call_without_leaking_content() {
+        let mut annotated_delta = create_test_delta(
+            0,
+            "",
+            Some(dynamo_protocols::types::Role::Assistant),
+            Some(dynamo_protocols::types::FinishReason::Length),
+            None,
+            Some(r#"{"name":"search","arguments":{}}"#),
+        );
+        annotated_delta
+            .data
+            .as_mut()
+            .expect("test delta data")
+            .inner
+            .choices[0]
+            .delta
+            .tool_calls
+            .as_mut()
+            .expect("structured tool call")[0]
+            .function
+            .as_mut()
+            .expect("tool function")
+            .arguments = Some(r#"{"query":"Par"#.to_string());
+        let response = DeltaAggregator::apply(
+            Box::pin(stream::iter(vec![annotated_delta])),
+            ParsingOptions::default(),
+        )
+        .await
+        .expect("aggregation should succeed");
+
+        let choice = &response.inner.choices[0];
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Length)
+        );
+        assert!(choice.message.tool_calls.is_none());
+        assert_eq!(choice.message.content, None);
+        assert!(!serde_json::to_string(choice).unwrap().contains("Par"));
+    }
+
+    #[tokio::test]
     async fn test_tool_calling_finish_reason_override_from_none() {
         // Test that when tool calls are present but finish reason is None, it gets set to ToolCalls
         let tool_call_json = r#"{"name": "calculate", "arguments": {"expression": "2+2"}}"#;
@@ -2542,11 +2621,11 @@ mod tests {
     //   in:  <tool_call>get_weather<arg_key>city</arg_key><arg_value>Bos   (finish_reason=length)
     //   out: finish=length  tool_calls=None  content=""
     // The parser sees an incomplete XML block and returns no tool call and no
-    // content, so the client gets an empty turn. The recovery path appends the
-    // raw partial markup as content so the caller can at least surface it.
+    // content. The non-streaming contract keeps the finish signal and suppresses
+    // the incomplete structured candidate rather than leaking parser markup.
 
     #[tokio::test]
-    async fn test_glm47_single_truncated_call_recovered_as_content() {
+    async fn test_glm47_single_truncated_call_is_suppressed() {
         let text = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Bos";
         let delta = create_test_delta(
             0,
@@ -2571,15 +2650,12 @@ mod tests {
             choice.message.tool_calls.is_none(),
             "incomplete call must not produce a structured tool_call"
         );
-        assert_eq!(
-            choice.message.content,
-            Some(ChatCompletionMessageContent::Text(text.to_string())),
-            "truncated markup must be returned as raw content"
-        );
+        assert_eq!(choice.message.content, None);
+        assert!(!serde_json::to_string(choice).unwrap().contains(text));
     }
 
     #[tokio::test]
-    async fn test_glm47_complete_call_then_truncated_second_recovered() {
+    async fn test_glm47_complete_call_then_truncated_second_is_suppressed() {
         // First call complete, second truncated mid-argument.
         let text = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Boston</arg_value></tool_call><tool_call>get_time<arg_key>tz</arg_key><arg_value>US/E";
         let delta = create_test_delta(
@@ -2597,7 +2673,7 @@ mod tests {
                 .unwrap();
 
         let choice = &result.inner.choices[0];
-        // First complete call is parsed into tool_calls.
+        // First complete call is parsed into tool_calls and remains available.
         let tool_calls = choice.message.tool_calls.as_ref().unwrap();
         assert_eq!(
             tool_calls.len(),
@@ -2605,20 +2681,13 @@ mod tests {
             "first complete call must be structured"
         );
         assert_eq!(tool_calls[0].function.name, "get_weather");
-        // Truncated second block is in content, not dropped.
-        let content = choice
-            .message
-            .content
-            .as_ref()
-            .expect("truncated second call must be in content");
-        let ChatCompletionMessageContent::Text(t) = content else {
-            panic!("content must be Text")
-        };
+        assert_eq!(choice.message.content, None);
         assert!(
-            t.contains("<tool_call>get_time"),
-            "truncated second call markup must be in content"
+            !serde_json::to_string(choice)
+                .unwrap()
+                .contains("<tool_call>get_time"),
+            "truncated second call markup must not leak into the response"
         );
-        assert!(!t.contains("</tool_call>"), "must not contain closing tag");
     }
 
     #[tokio::test]

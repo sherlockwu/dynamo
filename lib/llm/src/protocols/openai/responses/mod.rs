@@ -1235,17 +1235,20 @@ pub fn chat_completion_to_response(
         Status::Completed
     };
     if output_limit_reached {
-        // Unary responses do not expose explicit phase boundaries. A message
-        // or function call proves reasoning finished before the terminal item
-        // exhausted the output budget.
-        let reasoning_completed = output
+        // The budget runs out once, inside the item the model was still writing.
+        // Earlier output items were complete and must not be relabelled.
+        let terminal = output
             .iter()
-            .any(|item| matches!(item, OutputItem::Message(_) | OutputItem::FunctionCall(_)));
-        for item in &mut output {
+            .rposition(|item| matches!(item, OutputItem::Message(_) | OutputItem::FunctionCall(_)));
+        for (index, item) in output.iter_mut().enumerate() {
             match item {
-                OutputItem::Message(message) => message.status = OutputStatus::Incomplete,
-                OutputItem::FunctionCall(call) => call.status = Some(OutputStatus::Incomplete),
-                OutputItem::Reasoning(reasoning) if !reasoning_completed => {
+                OutputItem::Message(message) if Some(index) == terminal => {
+                    message.status = OutputStatus::Incomplete
+                }
+                OutputItem::FunctionCall(call) if Some(index) == terminal => {
+                    call.status = Some(OutputStatus::Incomplete)
+                }
+                OutputItem::Reasoning(reasoning) if terminal.is_none() => {
                     reasoning.status = Some(OutputStatus::Incomplete)
                 }
                 _ => {}
@@ -3347,18 +3350,31 @@ thinking
         finish_reason: dynamo_protocols::types::FinishReason,
         arguments: &str,
     ) -> NvCreateChatCompletionResponse {
+        make_chat_resp_with_tool_calls(finish_reason, &[arguments])
+    }
+
+    fn make_chat_resp_with_tool_calls(
+        finish_reason: dynamo_protocols::types::FinishReason,
+        arguments: &[&str],
+    ) -> NvCreateChatCompletionResponse {
         let mut response = make_chat_resp_with_text("");
         let choice = &mut response.inner.choices[0];
         choice.finish_reason = Some(finish_reason);
         choice.message.content = None;
-        choice.message.tool_calls = Some(vec![ChatCompletionMessageToolCall {
-            id: "call_abc".into(),
-            r#type: FunctionType::Function,
-            function: dynamo_protocols::types::FunctionCall {
-                name: "get_weather".into(),
-                arguments: arguments.into(),
-            },
-        }]);
+        choice.message.tool_calls = Some(
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(index, arguments)| ChatCompletionMessageToolCall {
+                    id: format!("call_abc{index}"),
+                    r#type: FunctionType::Function,
+                    function: dynamo_protocols::types::FunctionCall {
+                        name: "get_weather".into(),
+                        arguments: (*arguments).into(),
+                    },
+                })
+                .collect(),
+        );
         response
     }
 
@@ -3578,6 +3594,35 @@ thinking
             panic!("expected function call output");
         };
         assert_eq!(call.status, Some(OutputStatus::Incomplete));
+    }
+
+    #[test]
+    fn test_length_marks_only_the_terminal_tool_call_incomplete() {
+        let chat_resp = make_chat_resp_with_tool_calls(
+            dynamo_protocols::types::FinishReason::Length,
+            &[r#"{"location":"SF"}"#, r#"{"location":"NY"#],
+        );
+
+        let response =
+            chat_completion_to_response(chat_resp, &ResponseParams::default(), None).unwrap();
+
+        assert_eq!(response.inner.status, Status::Incomplete);
+        let statuses: Vec<_> = response
+            .inner
+            .output
+            .iter()
+            .filter_map(|item| match item {
+                OutputItem::FunctionCall(call) => Some(call.status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                Some(OutputStatus::Completed),
+                Some(OutputStatus::Incomplete)
+            ]
+        );
     }
 
     #[test]
