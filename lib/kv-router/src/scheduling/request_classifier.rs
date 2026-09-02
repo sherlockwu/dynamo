@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::policy_queue::QueueSnapshot;
 use super::types::{KvSchedulerError, SessionContext};
-use crate::protocols::WorkerWithDpRank;
+use crate::protocols::{WorkerAffinityTarget, WorkerWithDpRank};
 
 static NEXT_CLASSIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -41,6 +41,15 @@ struct ClassificationOverrides {
     policy_class: Option<String>,
     due_at: Option<Instant>,
     scheduling_cost_tokens: Option<usize>,
+    worker_selection_target: Option<Option<WorkerAffinityTarget>>,
+}
+
+pub(crate) struct ClassificationQueueInputs {
+    pub(crate) policy_class: Option<String>,
+    pub(crate) due_at: Option<Instant>,
+    pub(crate) scheduling_cost_tokens: Option<usize>,
+    pub(crate) initial_cached_tokens: usize,
+    pub(crate) worker_selection_target: Option<Option<WorkerAffinityTarget>>,
 }
 
 impl ClassifyRequest {
@@ -123,19 +132,35 @@ impl ClassifyRequest {
         self.overrides.scheduling_cost_tokens = Some(scheduling_cost_tokens);
     }
 
+    /// Ask Place to prefer one worker and data-parallel rank for this request.
+    ///
+    /// The router keeps final selection authority: caller constraints and worker eligibility are
+    /// still enforced, and a custom worker-selection policy may fall back when the target is not
+    /// eligible. The target replaces any session-affinity target for this request only.
+    pub fn set_worker_selection_target(&mut self, worker: WorkerWithDpRank) {
+        self.overrides.worker_selection_target = Some(Some(worker.into()));
+    }
+
+    /// Remove the session-affinity target from this request before Place.
+    ///
+    /// Required caller routing constraints remain in force. This is primarily useful with soft
+    /// session affinity when a classifier deliberately repacks work across workers.
+    pub fn clear_worker_selection_target(&mut self) {
+        self.overrides.worker_selection_target = Some(None);
+    }
+
     pub fn session_context(&self) -> Option<&SessionContext> {
         self.session_context.as_ref()
     }
 
-    pub(crate) fn into_queue_inputs(
-        self,
-    ) -> (Option<String>, Option<Instant>, Option<usize>, usize) {
-        (
-            self.overrides.policy_class,
-            self.overrides.due_at,
-            self.overrides.scheduling_cost_tokens,
-            self.initial_cached_tokens,
-        )
+    pub(crate) fn into_queue_inputs(self) -> ClassificationQueueInputs {
+        ClassificationQueueInputs {
+            policy_class: self.overrides.policy_class,
+            due_at: self.overrides.due_at,
+            scheduling_cost_tokens: self.overrides.scheduling_cost_tokens,
+            initial_cached_tokens: self.initial_cached_tokens,
+            worker_selection_target: self.overrides.worker_selection_target,
+        }
     }
 }
 
@@ -775,7 +800,12 @@ mod tests {
         assert_eq!(result.request_id(), Some("request-1"));
         assert_eq!(result.policy_class(), Some("latency"));
         assert_eq!(result.scheduling_cost_tokens(), 96);
-        assert_eq!(result.into_queue_inputs(), (None, None, None, 32));
+        let inputs = result.into_queue_inputs();
+        assert_eq!(inputs.policy_class, None);
+        assert_eq!(inputs.due_at, None);
+        assert_eq!(inputs.scheduling_cost_tokens, None);
+        assert_eq!(inputs.initial_cached_tokens, 32);
+        assert_eq!(inputs.worker_selection_target, None);
     }
 
     struct EventReleasedClassifier {
