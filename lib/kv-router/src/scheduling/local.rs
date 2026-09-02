@@ -16,8 +16,7 @@ use super::overlap_refresh::{NoopOverlapScoresRefresh, OverlapScoresRefresh};
 use super::policy_config::PolicyProfile;
 use super::prefill_load::PrefillLoadEstimator;
 use super::queue::{
-    AdmissionCounterSnapshot, ClassQueueStats, SchedulerBookingCleanup, SchedulerBookingDescriptor,
-    SchedulerQueue,
+    ClassQueueStats, SchedulerBookingCleanup, SchedulerBookingDescriptor, SchedulerQueue,
 };
 use super::request_classifier::{RequestClassifier, RequestClassifierRuntime, RequestLifecycle};
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
@@ -332,23 +331,18 @@ where
         &self,
         request: ScheduleRequest,
     ) -> Result<AdmittedSchedulingResponse, KvSchedulerError> {
-        let input_tokens = request.isl_tokens;
-        self.schedule_request_admitted_with_context(request, input_tokens, StdInstant::now(), None)
+        self.schedule_request_admitted_with_context(request, StdInstant::now())
             .await
     }
 
-    /// Schedule with the router's original ingress timing and caller deadline.
+    /// Schedule with the router's original ingress timing.
     #[doc(hidden)]
     pub async fn schedule_request_admitted_with_context(
         &self,
         request: ScheduleRequest,
-        input_tokens: usize,
         ingress_at: StdInstant,
-        caller_deadline: Option<StdInstant>,
     ) -> Result<AdmittedSchedulingResponse, KvSchedulerError> {
-        let classified_request = self
-            .classify_request(&request, input_tokens, ingress_at, caller_deadline)
-            .await?;
+        let classified_request = self.classify_request(&request, ingress_at).await?;
         let tracked = request.mode.is_tracked();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
@@ -390,9 +384,7 @@ where
     async fn classify_request(
         &self,
         request: &ScheduleRequest,
-        input_tokens: usize,
         ingress_at: StdInstant,
-        caller_deadline: Option<StdInstant>,
     ) -> Result<Option<super::request_classifier::ClassifyRequest>, KvSchedulerError> {
         if matches!(request.mode, ScheduleMode::QueryOnly { .. }) {
             return Ok(None);
@@ -400,30 +392,21 @@ where
         let Some(classifier) = self.request_classifier.get() else {
             return Ok(None);
         };
-        let request_id = request.mode.tracked_request_id().ok_or_else(|| {
-            KvSchedulerError::BookingFailed(
-                "classifier admission requires a tracked request".to_string(),
-            )
-        })?;
+        let request_id = request
+            .mode
+            .tracked_request_id()
+            .expect("non-QueryOnly ScheduleMode carries a request id");
+        // A tracked admission with no registered lifecycle (Python bindings
+        // `best_worker`, `RouterRequest::New`) never emits lifecycle events, so
+        // classifying it would corrupt plugin bookkeeping. It uses the default
+        // queue inputs, exactly as if no classifier were installed.
         if !classifier.has_request(request_id) {
-            return Err(KvSchedulerError::InvalidClassificationMetadata(
-                "tracked classifier admission requires a request lifecycle".to_string(),
-            ));
+            return Ok(None);
         }
         classifier
-            .classify_with(self.queue.classify_request(
-                request,
-                input_tokens,
-                ingress_at,
-                caller_deadline,
-            ))
+            .classify_with(self.queue.classify_request(request, ingress_at))
             .await
             .map(Some)
-            .inspect_err(|error| {
-                if matches!(error, KvSchedulerError::DueTimeExpired) {
-                    self.queue.record_due_time_passed();
-                }
-            })
     }
 
     #[doc(hidden)]
@@ -446,10 +429,6 @@ where
             .get()
             .map(|classifier| classifier.begin_request(request_id))
             .transpose()
-    }
-
-    pub fn admission_counters(&self) -> AdmissionCounterSnapshot {
-        self.queue.admission_counters()
     }
 
     /// Select a worker from current scheduler state without queue admission or booking.

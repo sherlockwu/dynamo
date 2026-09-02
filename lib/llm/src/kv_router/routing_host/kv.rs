@@ -105,6 +105,13 @@ where
             Err(error) => {
                 if let Some(mut lifecycle) = lifecycle.take() {
                     if let Some(classifier_error) = classification_failure(&error) {
+                        // The client only sees the sanitized message below, so this log
+                        // is the operator's sole copy of the original failure.
+                        tracing::error!(
+                            request_id = %request.context().id(),
+                            error = %classifier_error,
+                            "request classifier failed"
+                        );
                         lifecycle.abort(Some(classifier_abort_error(classifier_error)));
                         return Err(anyhow::anyhow!(
                             DynamoError::builder()

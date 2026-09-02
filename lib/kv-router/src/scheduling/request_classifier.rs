@@ -30,7 +30,6 @@ pub struct ClassifyRequest {
     policy_class: Option<String>,
     overrides: ClassificationOverrides,
     ingress_at: Instant,
-    caller_deadline: Option<Instant>,
     input_tokens: usize,
     initial_cached_tokens: usize,
     session_context: Option<SessionContext>,
@@ -46,14 +45,13 @@ struct ClassificationOverrides {
 impl ClassifyRequest {
     #[cfg(test)]
     pub(crate) fn new(input_tokens: usize, initial_cached_tokens: usize) -> Self {
-        Self::with_timing(input_tokens, initial_cached_tokens, Instant::now(), None)
+        Self::with_timing(input_tokens, initial_cached_tokens, Instant::now())
     }
 
     pub(crate) fn with_timing(
         input_tokens: usize,
         initial_cached_tokens: usize,
         ingress_at: Instant,
-        caller_deadline: Option<Instant>,
     ) -> Self {
         Self {
             classification_id: 0,
@@ -61,7 +59,6 @@ impl ClassifyRequest {
             policy_class: None,
             overrides: ClassificationOverrides::default(),
             ingress_at,
-            caller_deadline,
             input_tokens,
             initial_cached_tokens: initial_cached_tokens.min(input_tokens),
             session_context: None,
@@ -105,11 +102,6 @@ impl ClassifyRequest {
     /// Return the original router ingress time on the monotonic clock.
     pub fn ingress_at(&self) -> Instant {
         self.ingress_at
-    }
-
-    /// Return the caller's authoritative deadline, when one was supplied.
-    pub fn caller_deadline(&self) -> Option<Instant> {
-        self.caller_deadline
     }
 
     pub fn due_at(&self) -> Option<Instant> {
@@ -236,6 +228,9 @@ pub(crate) struct RequestClassifierRuntime {
     // Arc: the delivery task holds its own handle to the classifier.
     classifier: Arc<AsyncMutex<Box<dyn RequestClassifier>>>,
     live_requests: Mutex<HashMap<String, Option<ClassificationOverrides>>>,
+    // Unbounded because `Drop` must send without awaiting. Depth is bounded by
+    // event rate x `on_event` latency: a persistently slow `on_event` delays
+    // plugin bookkeeping and grows this queue.
     events: mpsc::UnboundedSender<ClassifyEvent>,
     shutdown: CancellationToken,
 }
@@ -299,7 +294,6 @@ impl RequestClassifierRuntime {
             return Ok(request);
         }
 
-        let deadline = request.caller_deadline();
         let classification_id = NEXT_CLASSIFICATION_ID.fetch_add(1, Ordering::Relaxed);
         request.classification_id = classification_id;
         let classification = {
@@ -310,16 +304,9 @@ impl RequestClassifierRuntime {
         };
         let classification = AssertUnwindSafe(classification).catch_unwind();
 
-        let expiry = async move {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                None => std::future::pending().await,
-            }
-        };
         let result = tokio::select! {
             biased;
             _ = self.shutdown.cancelled() => return Err(KvSchedulerError::SubscriberShutdown),
-            _ = expiry => return Err(KvSchedulerError::DueTimeExpired),
             result = classification => result,
         };
         let classified = result
@@ -759,8 +746,8 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_and_deadline_abort_pending_classification() {
+    #[tokio::test]
+    async fn cancellation_aborts_pending_classification() {
         let entered = Arc::new(AtomicUsize::new(0));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let runtime = RequestClassifierRuntime::new(
@@ -784,31 +771,6 @@ mod tests {
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         assert_eq!(event_rx.recv().await.as_deref(), Some("cancelled"));
-
-        let deadline_runtime = Arc::clone(&runtime);
-        let deadline = tokio::spawn(async move {
-            let _lifecycle = deadline_runtime.begin_request("deadline").unwrap();
-            deadline_runtime
-                .classify_with(
-                    ClassifyRequest::with_timing(
-                        1,
-                        0,
-                        Instant::now(),
-                        Some(Instant::now() + std::time::Duration::from_secs(1)),
-                    )
-                    .with_request_id("deadline"),
-                )
-                .await
-        });
-        while entered.load(Ordering::Relaxed) < 2 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        assert!(matches!(
-            deadline.await.unwrap(),
-            Err(KvSchedulerError::DueTimeExpired)
-        ));
-        assert_eq!(event_rx.recv().await.as_deref(), Some("deadline"));
         assert!(event_rx.try_recv().is_err());
     }
 

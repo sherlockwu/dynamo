@@ -50,12 +50,14 @@ struct ClassQueueCounters {
     pending_cached_tokens: AtomicUsize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmissionCounterSnapshot {
-    pub received: u64,
-    pub due_time_passed: u64,
+pub(crate) struct AdmissionCounterSnapshot {
+    pub(crate) received: u64,
+    pub(crate) due_time_passed: u64,
 }
 
+// TODO: wire into the router metrics exporter and re-expose through KvRouter.
 #[derive(Default)]
 struct AdmissionCounters {
     received: AtomicU64,
@@ -71,6 +73,7 @@ impl AdmissionCounters {
         self.due_time_passed.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> AdmissionCounterSnapshot {
         AdmissionCounterSnapshot {
             received: self.received.load(AtomicOrdering::Relaxed),
@@ -849,12 +852,13 @@ impl<
         }
     }
 
+    /// Classification uses `request.isl_tokens` — the routing-token basis the
+    /// queue's bucketing, limits, and DRR cost already use — so a pass-through
+    /// classifier is behavior-identical to no classifier.
     pub(crate) fn classify_request(
         &self,
         request: &super::types::ScheduleRequest,
-        input_tokens: usize,
         ingress_at: StdInstant,
-        caller_deadline: Option<StdInstant>,
     ) -> ClassifyRequest {
         let workers = self.workers_with_configs.borrow();
         let cached_tokens = super::types::best_cached_tokens(
@@ -868,7 +872,7 @@ impl<
             &workers,
         );
         let mut classification =
-            ClassifyRequest::with_timing(input_tokens, cached_tokens, ingress_at, caller_deadline);
+            ClassifyRequest::with_timing(request.isl_tokens, cached_tokens, ingress_at);
         if let Some(request_id) = request.mode.request_id() {
             classification = classification.with_request_id(request_id);
         }
@@ -904,15 +908,8 @@ impl<
         classified_request: ClassifyRequest,
         ingress_at: StdInstant,
     ) -> Result<QueueMetadata, KvSchedulerError> {
-        let input_tokens = classified_request.input_tokens();
-        let caller_deadline = classified_request.caller_deadline();
-        let (policy_class, classifier_due_at, scheduling_cost_tokens, initial_cached_tokens) =
+        let (policy_class, due_at, scheduling_cost_tokens, initial_cached_tokens) =
             classified_request.into_queue_inputs();
-        let due_at = match (classifier_due_at, caller_deadline) {
-            (Some(classifier), Some(caller)) => Some(classifier.min(caller)),
-            (Some(classifier), None) => Some(classifier),
-            (None, caller) => caller,
-        };
 
         if scheduling_cost_tokens == Some(0) {
             return Err(KvSchedulerError::InvalidClassificationMetadata(
@@ -923,7 +920,9 @@ impl<
             return Err(KvSchedulerError::DueTimeExpired);
         }
 
-        let mut snapshot = QueueSnapshot::new(input_tokens, initial_cached_tokens);
+        // Same token basis as `default_queue_metadata`: the queue keys every
+        // count off the routing tokens regardless of classification.
+        let mut snapshot = QueueSnapshot::new(request.isl_tokens, initial_cached_tokens);
         let class_index_override = policy_class
             .map(|policy_class| {
                 self.profile
@@ -978,7 +977,8 @@ impl<
         self.admission_counters.record_due_time_passed();
     }
 
-    pub fn admission_counters(&self) -> AdmissionCounterSnapshot {
+    #[cfg(test)]
+    pub(crate) fn admission_counters(&self) -> AdmissionCounterSnapshot {
         self.admission_counters.snapshot()
     }
 
@@ -1175,7 +1175,8 @@ impl<
                         block_hashes,
                         queue_metadata,
                     );
-                    let made_ready = enqueue_ready || (drain_cleanup && self.drain_cleanup());
+                    let cleanup_ready = drain_cleanup && self.drain_cleanup();
+                    let made_ready = enqueue_ready || cleanup_ready;
                     if made_ready {
                         self.handle_update(None).await;
                     }
@@ -1277,6 +1278,26 @@ impl<
         let class_index = queue_metadata.class_index;
         let snapshot = queue_metadata.snapshot;
         let class = self.profile.class(class_index);
+        // A zero-limit class never queues: keep the pre-policy-queue direct
+        // admission semantics by admitting while a worker has prefill capacity,
+        // and otherwise fall through so `queue_rejection` produces the same
+        // limit-zero rejection the queued path always has.
+        if class.request_queue_limit_per_worker == Some(0) {
+            let should_queue = class.queueing_enabled()
+                && (self.pending.has_backlog(class_index) || {
+                    let active_tokens = self.slots.active_tokens(decay_now);
+                    let configs = self.workers_with_configs.borrow();
+                    Self::all_workers_prefill_busy_with(
+                        &active_tokens,
+                        &configs,
+                        class,
+                        request.eligibility(),
+                    )
+                });
+            if !should_queue {
+                return self.admit_one(request, attempt_tx, lifecycle_transfer, decay_now);
+            }
+        }
         tracing::debug!(policy_class = class.name, "ordering request");
         let priority_jump = request.priority_jump;
         let strict_priority = request.strict_priority;
@@ -2558,17 +2579,11 @@ policy_classes:
         let (mut request, _rx) = make_request("classified", 16);
         request.policy_class = Some("latency".to_string());
         let ingress_at = StdInstant::now();
-        let caller_deadline = ingress_at + Duration::from_secs(10);
-        let mut classified = queue.classify_request(
-            &classify_source(&request),
-            16,
-            ingress_at,
-            Some(caller_deadline),
-        );
+        let due_at = ingress_at + Duration::from_secs(20);
+        let mut classified = queue.classify_request(&classify_source(&request), ingress_at);
         assert_eq!(classified.ingress_at(), ingress_at);
-        assert_eq!(classified.caller_deadline(), Some(caller_deadline));
         classified.set_policy_class("bulk");
-        classified.set_due_at(ingress_at + Duration::from_secs(20));
+        classified.set_due_at(due_at);
         classified.set_scheduling_cost_tokens(7);
 
         let metadata = queue
@@ -2579,7 +2594,7 @@ policy_classes:
             "bulk_cached"
         );
         assert_eq!(metadata.snapshot.scheduling_cost_tokens, 7);
-        assert_eq!(metadata.due_at, Some(caller_deadline));
+        assert_eq!(metadata.due_at, Some(due_at));
         let mut order = PolicyQueue::new(queue.profile.clone());
         order
             .enqueue_with_due_at(
@@ -2600,22 +2615,21 @@ policy_classes:
             7
         );
 
-        let mut invalid = queue.classify_request(&classify_source(&request), 16, ingress_at, None);
+        let mut invalid = queue.classify_request(&classify_source(&request), ingress_at);
         invalid.set_policy_class("missing");
         assert!(matches!(
             queue.validate_classification(&request, invalid, ingress_at),
             Err(KvSchedulerError::InvalidClassificationMetadata(_))
         ));
 
-        let mut physical = queue.classify_request(&classify_source(&request), 16, ingress_at, None);
+        let mut physical = queue.classify_request(&classify_source(&request), ingress_at);
         physical.set_policy_class("latency_cached");
         assert!(matches!(
             queue.validate_classification(&request, physical, ingress_at),
             Err(KvSchedulerError::InvalidClassificationMetadata(_))
         ));
 
-        let mut zero_cost =
-            queue.classify_request(&classify_source(&request), 16, ingress_at, None);
+        let mut zero_cost = queue.classify_request(&classify_source(&request), ingress_at);
         zero_cost.set_scheduling_cost_tokens(0);
         assert!(matches!(
             queue.validate_classification(&request, zero_cost, ingress_at),
@@ -2632,8 +2646,7 @@ policy_classes:
 
         let (queued, queued_rx) = make_request("due", 64);
         let ingress_at = StdInstant::now();
-        let mut classified =
-            queue.classify_request(&classify_source(&queued), 64, ingress_at, None);
+        let mut classified = queue.classify_request(&classify_source(&queued), ingress_at);
         classified.set_due_at(ingress_at + Duration::from_secs(1));
         queue
             .enqueue_admitted_with_block_hashes_and_lease(
@@ -2682,8 +2695,7 @@ policy_classes:
 
         let (queued, queued_rx) = make_request("due-during-refresh", isl);
         let ingress_at = StdInstant::now();
-        let mut classified =
-            queue.classify_request(&classify_source(&queued), isl, ingress_at, None);
+        let mut classified = queue.classify_request(&classify_source(&queued), ingress_at);
         classified.set_due_at(ingress_at + Duration::from_secs(12));
         queue
             .enqueue_admitted_with_block_hashes_and_lease(
@@ -2721,7 +2733,7 @@ policy_classes:
     }
 
     #[tokio::test]
-    async fn idle_worker_still_obeys_zero_class_queue_limit() {
+    async fn zero_class_queue_limit_never_queues() {
         let profile = policy_profile(
             r#"
 default_policy_family: capped
@@ -2733,18 +2745,35 @@ policy_classes:
     policy_family: capped
     cache_bucket: all
     quantum: 1
+    prefill_busy_threshold: 0
     request_queue_limit_per_worker: 0
 "#,
         );
         let (queue, slots) = make_queue_with_profile(1, 16, 64, profile);
-        let (request, response_rx) = make_request("idle-rejected", 1);
 
-        queue.enqueue(request).await;
+        // An idle worker admits a zero-limit request directly, bypassing the
+        // policy queue.
+        let (admitted, admitted_rx) = make_request("admitted-idle", 64);
+        queue.enqueue(admitted).await;
+        admitted_rx.await.unwrap().unwrap();
+        assert_eq!(queue.pending_count(), 0);
 
+        // With every worker busy the request would have to queue, so the zero
+        // limit rejects it instead of parking it.
+        let (rejected, rejected_rx) = make_request("rejected-busy", 64);
+        queue.enqueue(rejected).await;
         assert!(matches!(
-            response_rx.await.unwrap(),
+            rejected_rx.await.unwrap(),
             Err(KvSchedulerError::QueueRejected(_))
         ));
+        assert_eq!(queue.pending_count(), 0);
+
+        slots
+            .mark_prefill_completed(&"admitted-idle".to_string(), decay_now())
+            .unwrap();
+        slots
+            .free(&"admitted-idle".to_string(), decay_now())
+            .unwrap();
         slots.assert_completely_drained(decay_now());
     }
 

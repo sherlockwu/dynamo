@@ -673,6 +673,9 @@ impl<T> PolicyQueue<T> {
             .range(..=(now_key, u64::MAX))
             .map(|(_, enqueue_seq)| *enqueue_seq)
             .collect();
+        if expired_sequences.is_empty() {
+            return Vec::new();
+        }
         let mut expired = Vec::new();
         for class_index in 0..self.classes.len() {
             expired.extend(

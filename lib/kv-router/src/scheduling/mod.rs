@@ -38,7 +38,6 @@ pub use prefill_load::{
     InvalidEffectivePrefillTokens, PrefillLoadEstimator, effective_prefill_tokens,
     prefill_load_hint_from_effective_tokens,
 };
-pub use queue::AdmissionCounterSnapshot;
 pub use queue_admission::{RequestProgress, RequestProgressUpdater, WorkerPlacement};
 pub use request_classifier::{
     AbortCause, ClassifierError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,

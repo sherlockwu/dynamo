@@ -1129,6 +1129,60 @@ async fn classifier_pause_defers_admission_until_resumed() {
     runtime.shutdown();
 }
 
+#[tokio::test]
+async fn tracked_admission_without_lifecycle_bypasses_classifier() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
+    let (router, runtime) = router_with_classifier(
+        RecordingClassifier {
+            calls: Arc::clone(&calls),
+            observations: observations_tx,
+        },
+        None,
+    )
+    .await;
+
+    // `find_best_match_details` with `update_states` is a tracked admission
+    // that never calls `begin_request_lifecycle` — the same funnel as the
+    // Python bindings `best_worker` and the standalone `RouterRequest::New`
+    // path. The plugin would receive no lifecycle events for it, so admission
+    // must use the default queue inputs instead of the classifier.
+    let outcome = router
+        .kv_router()
+        .find_best_match_details(
+            Some("unregistered-tracked"),
+            &[1, 2, 3, 4],
+            None,
+            None,
+            true,
+            false,
+            None,
+            None,
+            0.0,
+            0,
+            None,
+            None,
+            None,
+            RoutingConstraints::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        crate::kv_router::FindBestMatchOutcome::Routed { .. }
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    router
+        .kv_router()
+        .free("unregistered-tracked")
+        .await
+        .unwrap();
+    assert!(observations_rx.try_recv().is_err());
+
+    drop(router);
+    runtime.shutdown();
+}
+
 struct TokenContractClassifier {
     classified: mpsc::UnboundedSender<usize>,
     completed: mpsc::UnboundedSender<usize>,
@@ -1153,7 +1207,7 @@ impl RequestClassifier for TokenContractClassifier {
 }
 
 #[tokio::test]
-async fn classifier_and_completion_use_authoritative_multimodal_token_counts() {
+async fn classifier_and_completion_use_matching_token_counts() {
     let (classified_tx, mut classified_rx) = mpsc::unbounded_channel();
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
     let (router, runtime) = router_with_classifier(
@@ -1175,7 +1229,11 @@ async fn classifier_and_completion_use_authoritative_multimodal_token_counts() {
         .select_with_affinity(&request, RequestPhase::Aggregated, false)
         .await
         .unwrap();
-    assert_eq!(classified_rx.recv().await, Some(5));
+    // Classification and the scheduler queue share one token basis: the
+    // routing tokens (`isl_tokens`, 8 here), not the multimodal expanded
+    // prompt length (5), so a pass-through classifier cannot shift queue
+    // bucketing, limits, or DRR cost for multimodal requests.
+    assert_eq!(classified_rx.recv().await, Some(8));
 
     let mut guard = router
         .track_selection(&request, &mut selection, false)
