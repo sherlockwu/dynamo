@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::policy_queue::QueueSnapshot;
 use super::types::{KvSchedulerError, SessionContext};
+use super::{RequestProgress, RequestProgressUpdater};
 use crate::protocols::{WorkerAffinityTarget, WorkerWithDpRank};
 
 static NEXT_CLASSIFICATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -33,6 +34,7 @@ pub struct ClassifyRequest {
     ingress_at: Instant,
     input_tokens: usize,
     initial_cached_tokens: usize,
+    progress: RequestProgress,
     session_context: Option<SessionContext>,
 }
 
@@ -63,6 +65,7 @@ impl ClassifyRequest {
         initial_cached_tokens: usize,
         ingress_at: Instant,
     ) -> Self {
+        let (progress, _) = RequestProgress::new(input_tokens);
         Self {
             classification_id: 0,
             request_id: None,
@@ -71,6 +74,7 @@ impl ClassifyRequest {
             ingress_at,
             input_tokens,
             initial_cached_tokens: initial_cached_tokens.min(input_tokens),
+            progress,
             session_context: None,
         }
     }
@@ -107,6 +111,12 @@ impl ClassifyRequest {
 
     pub fn input_tokens(&self) -> usize {
         self.input_tokens
+    }
+
+    /// Return lock-free access to the latest logical context observed while
+    /// this request is live.
+    pub fn progress(&self) -> &RequestProgress {
+        &self.progress
     }
 
     /// Return the original router ingress time on the monotonic clock.
@@ -318,7 +328,7 @@ pub(crate) struct RequestClassifierRuntime {
     // Box: the install seam is object-safe and `Mutex::new` needs `Sized`;
     // Arc: the delivery task holds its own handle to the classifier.
     classifier: Arc<AsyncMutex<Box<dyn RequestClassifier>>>,
-    live_requests: Mutex<HashMap<String, Option<ClassificationOverrides>>>,
+    live_requests: Mutex<HashMap<String, LiveRequest>>,
     // Unbounded because `Drop` must send without awaiting. Depth is bounded by
     // event rate x `on_event` latency: a persistently slow `on_event` delays
     // plugin bookkeeping and grows this queue.
@@ -327,6 +337,12 @@ pub(crate) struct RequestClassifierRuntime {
     // Aborted on drop as a backstop for a shutdown token that never fires
     // while `on_event` is stuck.
     delivery: JoinHandle<()>,
+}
+
+struct LiveRequest {
+    overrides: Option<ClassificationOverrides>,
+    progress: RequestProgress,
+    progress_updater: RequestProgressUpdater,
 }
 
 impl RequestClassifierRuntime {
@@ -389,12 +405,17 @@ impl RequestClassifierRuntime {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
 
-        if let Some(overrides) = request.request_id().and_then(|request_id| {
-            self.live_requests
-                .lock()
-                .get(request_id)
-                .and_then(Clone::clone)
-        }) {
+        let request_id = request.request_id().map(str::to_owned);
+        let cached_overrides = request_id.as_deref().and_then(|request_id| {
+            let mut live_requests = self.live_requests.lock();
+            let live_request = live_requests.get_mut(request_id)?;
+            live_request
+                .progress_updater
+                .update_context_tokens(request.input_tokens);
+            request.progress = live_request.progress.clone();
+            live_request.overrides.clone()
+        });
+        if let Some(overrides) = cached_overrides {
             request.overrides = overrides;
             return Ok(request);
         }
@@ -426,7 +447,7 @@ impl RequestClassifierRuntime {
         if let Some(request_id) = classified.request_id()
             && let Some(cached) = self.live_requests.lock().get_mut(request_id)
         {
-            *cached = Some(classified.overrides.clone());
+            cached.overrides = Some(classified.overrides.clone());
         }
         Ok(classified)
     }
@@ -438,21 +459,28 @@ impl RequestClassifierRuntime {
         if self.shutdown.is_cancelled() {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
-        match self.live_requests.lock().entry(request_id.to_owned()) {
+        let progress_updater = match self.live_requests.lock().entry(request_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(KvSchedulerError::DuplicateClassificationRequestId(
                     request_id.to_owned(),
                 ));
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(None);
+                let (progress, progress_updater) = RequestProgress::new(0);
+                entry.insert(LiveRequest {
+                    overrides: None,
+                    progress,
+                    progress_updater: progress_updater.clone(),
+                });
+                progress_updater
             }
-        }
+        };
         Ok(RequestLifecycle {
             runtime: Arc::clone(self),
             request_id: request_id.to_owned(),
             worker: None,
             context_tokens: None,
+            progress_updater,
             phase: LifecyclePhase::Registered,
         })
     }
@@ -503,6 +531,7 @@ pub struct RequestLifecycle {
     request_id: String,
     worker: Option<WorkerWithDpRank>,
     context_tokens: Option<usize>,
+    progress_updater: RequestProgressUpdater,
     phase: LifecyclePhase,
 }
 
@@ -557,6 +586,9 @@ impl RequestLifecycle {
                 .unwrap_or_default()
                 .saturating_add(output_tokens),
         );
+        if let Some(context_tokens) = self.context_tokens {
+            self.progress_updater.update_context_tokens(context_tokens);
+        }
     }
 
     pub fn observe_context_tokens(&mut self, context_tokens: usize) {
@@ -564,6 +596,7 @@ impl RequestLifecycle {
             self.context_tokens
                 .map_or(context_tokens, |current| current.max(context_tokens)),
         );
+        self.progress_updater.update_context_tokens(context_tokens);
     }
 
     pub fn prepare_retry(&mut self) {
@@ -964,15 +997,23 @@ mod tests {
             .classify_with(ClassifyRequest::new(10, 10).with_request_id("request-1"))
             .await
             .unwrap();
+        assert_eq!(first.progress().context_tokens(), 10);
+        lifecycle.observe_context_tokens(10);
+        lifecycle.observe_output_tokens(5);
+        assert_eq!(first.progress().context_tokens(), 15);
         let retry = runtime
-            .classify_with(ClassifyRequest::new(20, 20).with_request_id("request-1"))
+            .classify_with(ClassifyRequest::new(12, 12).with_request_id("request-1"))
             .await
             .unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(first.input_tokens(), 10);
-        assert_eq!(retry.input_tokens(), 20);
+        assert_eq!(retry.input_tokens(), 12);
         assert_eq!(retry.scheduling_cost_tokens(), 7);
+        assert_eq!(retry.progress().context_tokens(), 15);
+        lifecycle.observe_context_tokens(20);
+        assert_eq!(first.progress().context_tokens(), 20);
+        assert_eq!(retry.progress().context_tokens(), 20);
         lifecycle.abort(None);
     }
 
