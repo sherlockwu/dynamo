@@ -202,7 +202,7 @@ impl AnthropicStreamConverter {
             let repaired_input = repair
                 .then(|| super::types::tool_use_input(&tool_call.name, &raw, true))
                 .flatten();
-            if repair && repaired_input.is_none() {
+            if !arguments_are_valid && !truncated {
                 continue;
             }
             let emitted_id = new_tool_use_id();
@@ -1519,6 +1519,37 @@ mod tests {
                 ..
             } if partial_json == r#"{"done": "cut""#
         )));
+    }
+
+    #[test]
+    fn test_stream_suppresses_malformed_non_length_tool_calls() {
+        for reason in [
+            FinishReason::Stop,
+            FinishReason::ToolCalls,
+            FinishReason::FunctionCall,
+            FinishReason::ContentFilter,
+        ] {
+            let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+            conv.process_chunk_tagged(&tool_call_chunk(
+                0,
+                Some("call-1"),
+                Some("record_literal"),
+                Some(r#"{"label": "cut""#),
+            ));
+            let mut events = conv.process_chunk_tagged(&finish_chunk(reason));
+            events.extend(conv.emit_end_events_tagged());
+
+            assert!(
+                events.iter().all(|event| !matches!(
+                    &event.data,
+                    AnthropicStreamEvent::ContentBlockStart {
+                        content_block: AnthropicResponseContentBlock::ToolUse { .. },
+                        ..
+                    }
+                )),
+                "malformed {reason:?} arguments must not create an executable tool block"
+            );
+        }
     }
 
     /// Buffered tool-argument fragments must carry the usage snapshot from their
