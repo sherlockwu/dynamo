@@ -371,7 +371,7 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
         "topic": "kv-events",
     }
     pub.native_kv_events_gpus_per_node = 1
-    monkeypatch.setenv("SLURM_STEP_NODELIST", "worker[01-02]")
+    monkeypatch.setenv("DYN_TRTLLM_KV_EVENT_HOSTS", "worker01,worker02")
 
     pub.initialize()
 
@@ -384,6 +384,42 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
     assert all(call.kwargs["zmq_topic"] == "kv-events" for call in calls)
     pub._init_publish_kv_cache_events_thread.assert_not_called()
     assert pub.publish_kv_cache_events_thread is None
+
+
+def test_native_kv_events_require_explicit_hosts_for_multinode(monkeypatch):
+    """Multi-node discovery must fail without the explicit launcher contract."""
+    pub, _module, _ = _build_publisher_stub(
+        monkeypatch, attention_dp_size=2, fpm_enabled=True
+    )
+    pub.native_kv_events_config = {
+        "endpoint": "tcp://*:5557",
+        "topic": "",
+    }
+    pub.native_kv_events_gpus_per_node = 1
+    monkeypatch.delenv("DYN_TRTLLM_KV_EVENT_HOSTS", raising=False)
+
+    with pytest.raises(RuntimeError, match="DYN_TRTLLM_KV_EVENT_HOSTS"):
+        pub.initialize()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "rank", "expected"),
+    [
+        ("ipc:///tmp/kv-events", 1, "ipc:///tmp/kv-events_dp1"),
+        ("inproc://kv-events", 2, "inproc://kv-events_dp2"),
+        ("tcp://127.0.0.1:5557", 2, "tcp://127.0.0.1:5559"),
+    ],
+)
+def test_native_kv_event_endpoint_offset_matches_trtllm_streaming_manager(
+    endpoint, rank, expected
+):
+    assert publisher_mod._offset_endpoint_port(endpoint, rank) == expected
+
+
+@pytest.mark.parametrize("endpoint", ["tcp://host", "tcp://host:0", "udp://host:5557"])
+def test_native_kv_event_endpoint_offset_rejects_invalid_endpoint(endpoint):
+    with pytest.raises(ValueError):
+        publisher_mod._offset_endpoint_port(endpoint, 1)
 
 
 def test_publisher_initialize_constructs_fpm_direct_publisher_when_fpm_enabled(

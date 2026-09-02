@@ -26,6 +26,7 @@ from dynamo.trtllm.tests.conftest import make_cli_args_fixture
 from dynamo.trtllm.utils.trtllm_utils import deep_update, warn_override_collisions
 from dynamo.trtllm.workers.llm_worker import (
     _populate_kv_cache_capacity,
+    _resolve_native_kv_events_config,
     _strip_postprocess_workers,
     init_llm_worker,
 )
@@ -459,6 +460,47 @@ class EngineArgsCaptured(Exception):
 def _mock_get_llm_engine(engine_args, *args, **kwargs):
     """Mock for get_llm_engine that captures engine_args and short-circuits."""
     raise EngineArgsCaptured(engine_args)
+
+
+def test_resolve_native_kv_events_config_uses_nested_kv_cache_config():
+    """TRT-LLM configures streaming events under kv_cache_config."""
+    resolved = _resolve_native_kv_events_config(
+        {
+            "kv_cache_config": {
+                "kv_events_config": {
+                    "enable_kv_cache_events": True,
+                    "publisher": "zmq",
+                    "endpoint": "tcp://*:6000",
+                    "topic": "kv-events",
+                }
+            }
+        }
+    )
+
+    assert resolved == {
+        "enable_kv_cache_events": True,
+        "publisher": "zmq",
+        "endpoint": "tcp://*:6000",
+        "topic": "kv-events",
+    }
+
+
+@pytest.mark.parametrize(
+    "kv_events_config",
+    [
+        {"enable_kv_cache_events": False},
+        {"enable_kv_cache_events": True, "publisher": "null"},
+    ],
+)
+def test_resolve_native_kv_events_config_skips_disabled_or_null_publisher(
+    kv_events_config,
+):
+    assert (
+        _resolve_native_kv_events_config(
+            {"kv_cache_config": {"kv_events_config": kv_events_config}}
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
