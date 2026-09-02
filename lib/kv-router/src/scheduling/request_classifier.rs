@@ -228,6 +228,71 @@ pub trait RequestClassifier: Send + 'static {
     async fn on_event(&mut self, _event: ClassifyEvent<'_>) {}
 }
 
+/// One live worker rank visible to a request-classifier plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestClassifierWorker {
+    worker: WorkerWithDpRank,
+    total_kv_blocks: Option<u64>,
+}
+
+impl RequestClassifierWorker {
+    pub fn new(worker: WorkerWithDpRank, total_kv_blocks: Option<u64>) -> Self {
+        Self {
+            worker,
+            total_kv_blocks,
+        }
+    }
+
+    pub fn worker(&self) -> WorkerWithDpRank {
+        self.worker
+    }
+
+    pub fn total_kv_blocks(&self) -> Option<u64> {
+        self.total_kv_blocks
+    }
+}
+
+/// Cached host inputs supplied when constructing one classifier instance.
+#[derive(Clone)]
+pub struct RequestClassifierContext {
+    block_size: u32,
+    workers: Arc<dyn Fn() -> Vec<RequestClassifierWorker> + Send + Sync>,
+}
+
+impl RequestClassifierContext {
+    pub fn new(
+        block_size: u32,
+        workers: impl Fn() -> Vec<RequestClassifierWorker> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            block_size,
+            workers: Arc::new(workers),
+        }
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Return a non-blocking snapshot from the host's existing discovery watcher.
+    pub fn workers(&self) -> Vec<RequestClassifierWorker> {
+        (self.workers)()
+    }
+}
+
+impl std::fmt::Debug for RequestClassifierContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestClassifierContext")
+            .field("block_size", &self.block_size)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Factory resolved once from the linked catalog and invoked for each routed model.
+pub type RequestClassifierFactory =
+    Arc<dyn Fn(RequestClassifierContext) -> Box<dyn RequestClassifier> + Send + Sync>;
+
 /// Owned lifecycle event queued between a request task and the delivery task.
 enum OwnedEvent {
     Sent {
