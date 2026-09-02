@@ -405,15 +405,21 @@ impl RequestClassifierRuntime {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
 
-        let request_id = request.request_id().map(str::to_owned);
-        let cached_overrides = request_id.as_deref().and_then(|request_id| {
+        let input_tokens = request.input_tokens;
+        let live_request = request.request_id().and_then(|request_id| {
             let mut live_requests = self.live_requests.lock();
             let live_request = live_requests.get_mut(request_id)?;
             live_request
                 .progress_updater
-                .update_context_tokens(request.input_tokens);
-            request.progress = live_request.progress.clone();
-            live_request.overrides.clone()
+                .update_context_tokens(input_tokens);
+            Some((
+                live_request.progress.clone(),
+                live_request.overrides.clone(),
+            ))
+        });
+        let cached_overrides = live_request.and_then(|(progress, overrides)| {
+            request.progress = progress;
+            overrides
         });
         if let Some(overrides) = cached_overrides {
             request.overrides = overrides;
