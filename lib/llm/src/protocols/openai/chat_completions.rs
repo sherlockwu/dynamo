@@ -645,7 +645,6 @@ mod tests {
     fn test_conflicting_guided_decoding_options_fail_request_validation() {
         // Each pair is two constraints set at once; every one of them must be rejected.
         let conflicts = [
-            json!({"guided_json": {"type": "object"}, "guided_whitespace_pattern": "[\n ]?"}),
             json!({"guided_json": {"type": "object"}, "guided_regex": "a+"}),
             json!({"guided_regex": "a+", "guided_choice": ["x", "y"]}),
             json!({"guided_grammar": "root ::= \"a\"", "guided_json": {"type": "object"}}),
@@ -684,7 +683,6 @@ mod tests {
             json!({"guided_json": {"type": "object"}}),
             json!({"guided_regex": "a+"}),
             json!({"guided_choice": ["x", "y"]}),
-            json!({"guided_whitespace_pattern": "[\n ]?"}),
         ] {
             let mut body = json!({
                 "model": "test-model",
@@ -700,6 +698,39 @@ mod tests {
             ValidateRequest::validate(&request)
                 .unwrap_or_else(|e| panic!("{body} must stay valid, got: {e}"));
         }
+    }
+
+    #[test]
+    fn test_guided_json_with_whitespace_pattern_is_valid() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guided_json": {"type": "object"},
+            "guided_whitespace_pattern": "[\\n ]?"
+        }))
+        .expect("request should deserialize");
+
+        ValidateRequest::validate(&request).expect("whitespace pattern is a modifier");
+        let options = request
+            .extract_sampling_options()
+            .expect("sampling options should extract")
+            .guided_decoding
+            .expect("guided options should be present");
+        assert_eq!(options.json, Some(json!({"type": "object"})));
+        assert_eq!(options.whitespace_pattern.as_deref(), Some("[\\n ]?"));
+    }
+
+    #[test]
+    fn test_whitespace_pattern_without_primary_constraint_is_rejected() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guided_whitespace_pattern": "[\\n ]?"
+        }))
+        .expect("request should deserialize");
+
+        let error = ValidateRequest::validate(&request).expect_err("request is meaningless");
+        assert!(error.to_string().contains("requires a primary"));
     }
 
     #[test]

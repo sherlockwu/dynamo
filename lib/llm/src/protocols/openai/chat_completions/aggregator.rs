@@ -750,8 +750,6 @@ impl DeltaAggregator {
                 // parse_complete drops a value truncated at EOF instead of guessing it.
                 // Other families and the flag-off path keep the v1 finalize path.
                 // Guided JSON is handled above from the exact carried constraint.
-                let glm47_cfg = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
-
                 let parse_result = parse_complete_tool_output(
                     &choice.text,
                     parser,
@@ -787,20 +785,6 @@ impl DeltaAggregator {
                     || is_kimi_k3_parser(parser)
                 {
                     choice.text = content.unwrap_or_default();
-                } else if parser == "glm47"
-                    && matches!(
-                        choice.finish_reason,
-                        Some(dynamo_protocols::types::FinishReason::Length)
-                    )
-                    && choice.text.contains(glm47_cfg.tool_call_start.as_str())
-                {
-                    tracing::warn!(
-                        parser,
-                        "glm47: suppressing partial <tool_call> content on length finish"
-                    );
-                    if let Some(start) = choice.text.rfind(glm47_cfg.tool_call_start.as_str()) {
-                        choice.text.truncate(start);
-                    }
                 } else if choice.finish_reason
                     == Some(dynamo_protocols::types::FinishReason::Length)
                 {
@@ -2787,6 +2771,32 @@ mod tests {
                 .contains("<tool_call>get_time"),
             "truncated second call markup must not leak into the response"
         );
+    }
+
+    #[tokio::test]
+    async fn test_glm47_quoted_marker_prose_is_preserved_on_length_finish() {
+        let text = r#"The literal "<tool_call>" marker is part of the explanation."#;
+        let delta = create_test_delta(
+            0,
+            text,
+            Some(dynamo_protocols::types::Role::Assistant),
+            Some(dynamo_protocols::types::FinishReason::Length),
+            None,
+            None,
+        );
+        let result = DeltaAggregator::apply(
+            Box::pin(stream::iter(vec![delta])),
+            ParsingOptions::new(Some("glm47".to_string()), None),
+        )
+        .await
+        .unwrap();
+
+        let choice = &result.inner.choices[0];
+        assert_eq!(
+            choice.message.content,
+            Some(ChatCompletionMessageContent::Text(text.to_string()))
+        );
+        assert!(choice.message.tool_calls.is_none());
     }
 
     #[tokio::test]
