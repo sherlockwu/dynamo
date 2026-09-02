@@ -10,7 +10,7 @@ use std::{
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
-    scheduling::{ClassifierError, KvSchedulerError},
+    scheduling::{AbortCause, KvSchedulerError},
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -76,7 +76,6 @@ fn classification_failure(error: &Error) -> Option<&KvSchedulerError> {
             error,
             KvSchedulerError::RequestClassifierPanicked(_)
                 | KvSchedulerError::RequestClassifierFailed(_)
-                | KvSchedulerError::RequestClassifierReplacedRequest
                 | KvSchedulerError::DuplicateClassificationRequestId(_)
                 | KvSchedulerError::InvalidClassificationMetadata(_)
         )
@@ -84,19 +83,10 @@ fn classification_failure(error: &Error) -> Option<&KvSchedulerError> {
     })
 }
 
-fn classifier_abort_error(error: &KvSchedulerError) -> Arc<ClassifierError> {
+fn classifier_abort_error(error: &KvSchedulerError) -> Arc<AbortCause> {
     match error {
         KvSchedulerError::RequestClassifierFailed(source) => Arc::clone(source),
         _ => owned_abort_error(error),
-    }
-}
-
-fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error: &Error) {
-    if is_cancelled(error) {
-        return;
-    }
-    if let Some(operation) = operation.take() {
-        operation.invalidate();
     }
 }
 

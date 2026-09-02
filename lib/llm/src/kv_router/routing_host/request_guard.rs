@@ -26,7 +26,7 @@ use dynamo_kv_router::{
         BlockExtraInfo, BlockHashOptions, WorkerWithDpRank, compute_block_hash_for_seq,
         compute_next_seq_hash,
     },
-    scheduling::{AdmissionAttempt, ClassifierError, RequestLifecycle},
+    scheduling::{AbortCause, AdmissionAttempt, RequestLifecycle},
     selector::WorkerSelector,
 };
 use dynamo_runtime::{
@@ -847,7 +847,7 @@ where
         true
     }
 
-    pub(super) async fn abort_with_error(&mut self, error: Option<&ClassifierError>) {
+    pub(super) async fn abort_with_error(&mut self, error: Option<&AbortCause>) {
         if let Some(lifecycle) = self.request_lifecycle.as_mut() {
             lifecycle.abort(error.map(crate::protocols::common::preprocessor::owned_abort_error));
         }

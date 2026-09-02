@@ -122,9 +122,6 @@ pub enum KvSchedulerError {
     #[error("request classifier failed: {0}")]
     RequestClassifierFailed(std::sync::Arc<super::ClassifierError>),
 
-    #[error("request classifier replaced the logical request")]
-    RequestClassifierReplacedRequest,
-
     #[error("request classifier is already tracking request ID {0:?}")]
     DuplicateClassificationRequestId(String),
 

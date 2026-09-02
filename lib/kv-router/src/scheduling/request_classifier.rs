@@ -7,17 +7,17 @@ use std::error::Error;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use parking_lot::Mutex;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use super::policy_queue::QueueSnapshot;
 use super::types::{KvSchedulerError, SessionContext};
 use crate::protocols::WorkerWithDpRank;
 
@@ -122,9 +122,7 @@ impl ClassifyRequest {
 
     pub fn scheduling_cost_tokens(&self) -> usize {
         self.overrides.scheduling_cost_tokens.unwrap_or_else(|| {
-            self.input_tokens
-                .saturating_sub(self.initial_cached_tokens)
-                .max(1)
+            QueueSnapshot::new(self.input_tokens, self.initial_cached_tokens).scheduling_cost_tokens
         })
     }
 
@@ -148,28 +146,33 @@ impl ClassifyRequest {
     }
 }
 
+/// Error returned by [`RequestClassifier::classify`].
 pub type ClassifierError = dyn Error + Send + Sync + 'static;
+
+/// Cause delivered to the classifier when a request aborts. Produced by the
+/// router or the worker path, not by the classifier.
+pub type AbortCause = dyn Error + Send + Sync + 'static;
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ClassifyEvent<'a> {
+pub enum ClassifyEvent {
     Sent {
-        request_id: &'a str,
+        request_id: String,
         worker: WorkerWithDpRank,
     },
     Responding {
-        request_id: &'a str,
+        request_id: String,
         worker: WorkerWithDpRank,
     },
     Completed {
-        request_id: &'a str,
+        request_id: String,
         worker: WorkerWithDpRank,
         context_tokens: Option<usize>,
     },
     Aborted {
-        request_id: &'a str,
+        request_id: String,
         worker: Option<WorkerWithDpRank>,
-        error: Option<&'a ClassifierError>,
+        error: Option<Arc<AbortCause>>,
     },
 }
 
@@ -225,149 +228,67 @@ pub trait RequestClassifier: Send + 'static {
         Box::pin(async move { Ok(request) })
     }
 
-    async fn on_event(&mut self, _event: ClassifyEvent<'_>) {}
-}
-
-/// Owned lifecycle event queued between a request task and the delivery task.
-enum OwnedEvent {
-    Sent {
-        request_id: String,
-        worker: WorkerWithDpRank,
-    },
-    Responding {
-        request_id: String,
-        worker: WorkerWithDpRank,
-    },
-    Completed {
-        request_id: String,
-        worker: WorkerWithDpRank,
-        context_tokens: Option<usize>,
-    },
-    Aborted {
-        request_id: String,
-        worker: Option<WorkerWithDpRank>,
-        error: Option<Arc<ClassifierError>>,
-    },
-}
-
-impl OwnedEvent {
-    fn request_id(&self) -> &str {
-        match self {
-            Self::Sent { request_id, .. }
-            | Self::Responding { request_id, .. }
-            | Self::Completed { request_id, .. }
-            | Self::Aborted { request_id, .. } => request_id,
-        }
-    }
-
-    fn as_event(&self) -> ClassifyEvent<'_> {
-        match self {
-            Self::Sent { request_id, worker } => ClassifyEvent::Sent {
-                request_id,
-                worker: *worker,
-            },
-            Self::Responding { request_id, worker } => ClassifyEvent::Responding {
-                request_id,
-                worker: *worker,
-            },
-            Self::Completed {
-                request_id,
-                worker,
-                context_tokens,
-            } => ClassifyEvent::Completed {
-                request_id,
-                worker: *worker,
-                context_tokens: *context_tokens,
-            },
-            Self::Aborted {
-                request_id,
-                worker,
-                error,
-            } => ClassifyEvent::Aborted {
-                request_id,
-                worker: *worker,
-                error: error.as_deref(),
-            },
-        }
-    }
+    async fn on_event(&mut self, _event: ClassifyEvent) {}
 }
 
 pub(crate) struct RequestClassifierRuntime {
+    // Box: the install seam is object-safe and `Mutex::new` needs `Sized`;
+    // Arc: the delivery task holds its own handle to the classifier.
     classifier: Arc<AsyncMutex<Box<dyn RequestClassifier>>>,
     live_requests: Mutex<HashMap<String, Option<ClassificationOverrides>>>,
-    events: mpsc::UnboundedSender<OwnedEvent>,
-    // Bounded by live requests: at most one queued event per lifecycle phase.
-    pending_events: Mutex<Option<mpsc::UnboundedReceiver<OwnedEvent>>>,
-    delivery: OnceLock<()>,
+    events: mpsc::UnboundedSender<ClassifyEvent>,
     shutdown: CancellationToken,
 }
 
 impl RequestClassifierRuntime {
+    /// Create the runtime and spawn its event-delivery task. Must be called
+    /// from within a Tokio runtime.
     pub(crate) fn new(
         classifier: Box<dyn RequestClassifier>,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
-        let (events, receiver) = mpsc::unbounded_channel();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let classifier = Arc::new(AsyncMutex::new(classifier));
+        let delivery_classifier = Arc::clone(&classifier);
+        let delivery_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = delivery_shutdown.cancelled() => break,
+                    event = receiver.recv() => match event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                };
+                let mut classifier = delivery_classifier.lock().await;
+                if let Err(panic) = AssertUnwindSafe(classifier.on_event(event))
+                    .catch_unwind()
+                    .await
+                {
+                    tracing::error!(
+                        panic = %panic_message(panic),
+                        "Request classifier panicked while processing a lifecycle event"
+                    );
+                }
+            }
+        });
         Arc::new(Self {
-            classifier: Arc::new(AsyncMutex::new(classifier)),
+            classifier,
             live_requests: Mutex::new(HashMap::new()),
             events,
-            pending_events: Mutex::new(Some(receiver)),
-            delivery: OnceLock::new(),
             shutdown,
         })
     }
 
-    /// Start the event-delivery task once a runtime is available. Events sent
-    /// before the first classify or lifecycle registration stay queued.
-    fn ensure_delivery(&self) {
-        if self.delivery.get().is_some() {
-            return;
-        }
-        let Ok(handle) = Handle::try_current() else {
-            return;
-        };
-        self.delivery.get_or_init(|| {
-            let Some(mut events) = self.pending_events.lock().take() else {
-                return;
-            };
-            let classifier = Arc::clone(&self.classifier);
-            let shutdown = self.shutdown.clone();
-            handle.spawn(async move {
-                loop {
-                    let event = tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => break,
-                        event = events.recv() => match event {
-                            Some(event) => event,
-                            None => break,
-                        },
-                    };
-                    let mut classifier = classifier.lock().await;
-                    if let Err(panic) = AssertUnwindSafe(classifier.on_event(event.as_event()))
-                        .catch_unwind()
-                        .await
-                    {
-                        tracing::error!(
-                            panic = %panic_message(panic),
-                            "Request classifier panicked while processing a lifecycle event"
-                        );
-                    }
-                }
-            });
-        });
-    }
-
     pub(crate) async fn classify_with(
         &self,
-        make_request: impl FnOnce() -> ClassifyRequest,
+        mut request: ClassifyRequest,
     ) -> Result<ClassifyRequest, KvSchedulerError> {
         if self.shutdown.is_cancelled() {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
-        self.ensure_delivery();
 
-        let mut request = make_request();
         if let Some(overrides) = request.request_id().and_then(|request_id| {
             self.live_requests
                 .lock()
@@ -406,7 +327,9 @@ impl RequestClassifierRuntime {
             .map_err(|error| KvSchedulerError::RequestClassifierFailed(Arc::from(error)))?;
 
         if classified.classification_id != classification_id {
-            return Err(KvSchedulerError::RequestClassifierReplacedRequest);
+            return Err(KvSchedulerError::InvalidClassificationMetadata(
+                "classifier replaced the logical request".to_string(),
+            ));
         }
         if let Some(request_id) = classified.request_id()
             && let Some(cached) = self.live_requests.lock().get_mut(request_id)
@@ -423,7 +346,6 @@ impl RequestClassifierRuntime {
         if self.shutdown.is_cancelled() {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
-        self.ensure_delivery();
         match self.live_requests.lock().entry(request_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(KvSchedulerError::DuplicateClassificationRequestId(
@@ -447,20 +369,13 @@ impl RequestClassifierRuntime {
         self.live_requests.lock().contains_key(request_id)
     }
 
-    fn send_event(&self, event: OwnedEvent) {
+    fn send_event(&self, event: ClassifyEvent) {
         let _ = self.events.send(event);
     }
 
-    fn finish_request(&self, event: OwnedEvent) {
-        if self
-            .live_requests
-            .lock()
-            .remove(event.request_id())
-            .is_none()
-        {
-            return;
-        }
-        self.send_event(event);
+    /// Remove the request from the live set; returns whether it was live.
+    fn finish_request(&self, request_id: &str) -> bool {
+        self.live_requests.lock().remove(request_id).is_some()
     }
 }
 
@@ -506,7 +421,7 @@ impl RequestLifecycle {
         }
         self.worker = Some(worker);
         self.phase = LifecyclePhase::Sent;
-        self.runtime.send_event(OwnedEvent::Sent {
+        self.runtime.send_event(ClassifyEvent::Sent {
             request_id: self.request_id.clone(),
             worker,
         });
@@ -520,7 +435,7 @@ impl RequestLifecycle {
             return;
         };
         self.phase = LifecyclePhase::Responding;
-        self.runtime.send_event(OwnedEvent::Responding {
+        self.runtime.send_event(ClassifyEvent::Responding {
             request_id: self.request_id.clone(),
             worker,
         });
@@ -556,19 +471,25 @@ impl RequestLifecycle {
             return;
         };
         self.phase = LifecyclePhase::Terminal;
-        self.runtime.finish_request(OwnedEvent::Completed {
+        if !self.runtime.finish_request(&self.request_id) {
+            return;
+        }
+        self.runtime.send_event(ClassifyEvent::Completed {
             request_id: std::mem::take(&mut self.request_id),
             worker,
             context_tokens: self.context_tokens,
         });
     }
 
-    pub fn abort(&mut self, error: Option<Arc<ClassifierError>>) {
+    pub fn abort(&mut self, error: Option<Arc<AbortCause>>) {
         if self.phase == LifecyclePhase::Terminal {
             return;
         }
         self.phase = LifecyclePhase::Terminal;
-        self.runtime.finish_request(OwnedEvent::Aborted {
+        if !self.runtime.finish_request(&self.request_id) {
+            return;
+        }
+        self.runtime.send_event(ClassifyEvent::Aborted {
             request_id: std::mem::take(&mut self.request_id),
             worker: self.worker,
             error,
@@ -632,7 +553,7 @@ mod tests {
         );
 
         let error = runtime
-            .classify_with(|| ClassifyRequest::new(1, 0))
+            .classify_with(ClassifyRequest::new(1, 0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -641,7 +562,7 @@ mod tests {
                 if message == "synchronous classifier panic"
         ));
         runtime
-            .classify_with(|| ClassifyRequest::new(2, 0))
+            .classify_with(ClassifyRequest::new(2, 0))
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -672,7 +593,7 @@ mod tests {
         );
 
         let error = runtime
-            .classify_with(|| ClassifyRequest::new(1, 0))
+            .classify_with(ClassifyRequest::new(1, 0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -681,7 +602,7 @@ mod tests {
                 if message == "classifier future panic"
         ));
         runtime
-            .classify_with(|| ClassifyRequest::new(2, 0))
+            .classify_with(ClassifyRequest::new(2, 0))
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -705,7 +626,7 @@ mod tests {
             RequestClassifierRuntime::new(Box::new(FailingClassifier), CancellationToken::new());
 
         let error = runtime
-            .classify_with(|| ClassifyRequest::new(1, 0))
+            .classify_with(ClassifyRequest::new(1, 0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -729,17 +650,18 @@ mod tests {
             RequestClassifierRuntime::new(Box::new(ReplacingClassifier), CancellationToken::new());
 
         let error = runtime
-            .classify_with(|| ClassifyRequest::new(1, 0))
+            .classify_with(ClassifyRequest::new(1, 0))
             .await
             .unwrap_err();
         assert!(matches!(
             error,
-            KvSchedulerError::RequestClassifierReplacedRequest
+            KvSchedulerError::InvalidClassificationMetadata(message)
+                if message == "classifier replaced the logical request"
         ));
     }
 
-    #[test]
-    fn duplicate_live_request_id_is_rejected_until_lifecycle_ends() {
+    #[tokio::test]
+    async fn duplicate_live_request_id_is_rejected_until_lifecycle_ends() {
         let runtime =
             RequestClassifierRuntime::new(Box::new(PassThrough), CancellationToken::new());
         let lifecycle = runtime.begin_request("request-1").unwrap();
@@ -786,7 +708,7 @@ mod tests {
             })
         }
 
-        async fn on_event(&mut self, _event: ClassifyEvent<'_>) {
+        async fn on_event(&mut self, _event: ClassifyEvent) {
             self.released.notify_one();
         }
     }
@@ -808,7 +730,7 @@ mod tests {
         let pending_runtime = Arc::clone(&runtime);
         let pending = tokio::spawn(async move {
             pending_runtime
-                .classify_with(|| ClassifyRequest::new(1, 1))
+                .classify_with(ClassifyRequest::new(1, 1))
                 .await
         });
         entered.notified().await;
@@ -830,9 +752,9 @@ mod tests {
             Box::pin(std::future::pending())
         }
 
-        async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+        async fn on_event(&mut self, event: ClassifyEvent) {
             if let ClassifyEvent::Aborted { request_id, .. } = event {
-                self.events.send(request_id.to_owned()).unwrap();
+                self.events.send(request_id).unwrap();
             }
         }
     }
@@ -853,7 +775,7 @@ mod tests {
         let cancelled = tokio::spawn(async move {
             let _lifecycle = cancelled_runtime.begin_request("cancelled").unwrap();
             cancelled_runtime
-                .classify_with(|| ClassifyRequest::new(1, 0).with_request_id("cancelled"))
+                .classify_with(ClassifyRequest::new(1, 0).with_request_id("cancelled"))
                 .await
         });
         while entered.load(Ordering::Relaxed) < 1 {
@@ -867,15 +789,15 @@ mod tests {
         let deadline = tokio::spawn(async move {
             let _lifecycle = deadline_runtime.begin_request("deadline").unwrap();
             deadline_runtime
-                .classify_with(|| {
+                .classify_with(
                     ClassifyRequest::with_timing(
                         1,
                         0,
                         Instant::now(),
                         Some(Instant::now() + std::time::Duration::from_secs(1)),
                     )
-                    .with_request_id("deadline")
-                })
+                    .with_request_id("deadline"),
+                )
                 .await
         });
         while entered.load(Ordering::Relaxed) < 2 {
@@ -896,13 +818,13 @@ mod tests {
 
     #[async_trait]
     impl RequestClassifier for AwaitingEventClassifier {
-        async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+        async fn on_event(&mut self, event: ClassifyEvent) {
             let ClassifyEvent::Aborted { request_id, .. } = event else {
                 return;
             };
             // Await inside the callback: delivery must tolerate suspension.
             tokio::task::yield_now().await;
-            self.events.send(request_id.to_owned()).unwrap();
+            self.events.send(request_id).unwrap();
         }
     }
 
@@ -915,7 +837,7 @@ mod tests {
         );
         let lifecycle = runtime.begin_request("off-runtime-drop").unwrap();
         runtime
-            .classify_with(|| ClassifyRequest::new(1, 0).with_request_id("off-runtime-drop"))
+            .classify_with(ClassifyRequest::new(1, 0).with_request_id("off-runtime-drop"))
             .await
             .unwrap();
 
@@ -947,11 +869,11 @@ mod tests {
         let mut lifecycle = runtime.begin_request("request-1").unwrap();
 
         let first = runtime
-            .classify_with(|| ClassifyRequest::new(10, 10).with_request_id("request-1"))
+            .classify_with(ClassifyRequest::new(10, 10).with_request_id("request-1"))
             .await
             .unwrap();
         let retry = runtime
-            .classify_with(|| ClassifyRequest::new(20, 20).with_request_id("request-1"))
+            .classify_with(ClassifyRequest::new(20, 20).with_request_id("request-1"))
             .await
             .unwrap();
 
@@ -975,23 +897,19 @@ mod tests {
 
     #[async_trait]
     impl RequestClassifier for RecordingClassifier {
-        async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+        async fn on_event(&mut self, event: ClassifyEvent) {
             let event = match event {
                 ClassifyEvent::Sent { request_id, worker } => {
-                    Some(RecordedEvent::Sent(request_id.to_owned(), worker))
+                    Some(RecordedEvent::Sent(request_id, worker))
                 }
                 ClassifyEvent::Completed {
                     request_id,
                     worker,
                     context_tokens,
-                } => Some(RecordedEvent::Completed(
-                    request_id.to_owned(),
-                    worker,
-                    context_tokens,
-                )),
+                } => Some(RecordedEvent::Completed(request_id, worker, context_tokens)),
                 ClassifyEvent::Aborted {
                     request_id, worker, ..
-                } => Some(RecordedEvent::Aborted(request_id.to_owned(), worker)),
+                } => Some(RecordedEvent::Aborted(request_id, worker)),
                 ClassifyEvent::Responding { .. } => None,
             };
             if let Some(event) = event {
@@ -1010,7 +928,7 @@ mod tests {
         let worker = WorkerWithDpRank::new(7, 2);
         let mut lifecycle = runtime.begin_request("request-1").unwrap();
         runtime
-            .classify_with(|| ClassifyRequest::new(40, 0).with_request_id("request-1"))
+            .classify_with(ClassifyRequest::new(40, 0).with_request_id("request-1"))
             .await
             .unwrap();
 

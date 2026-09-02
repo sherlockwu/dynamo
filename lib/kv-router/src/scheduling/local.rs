@@ -346,7 +346,6 @@ where
         ingress_at: StdInstant,
         caller_deadline: Option<StdInstant>,
     ) -> Result<AdmittedSchedulingResponse, KvSchedulerError> {
-        self.queue.record_received();
         let classified_request = self
             .classify_request(&request, input_tokens, ingress_at, caller_deadline)
             .await?;
@@ -412,10 +411,12 @@ where
             ));
         }
         classifier
-            .classify_with(|| {
-                self.queue
-                    .classify_request(request, input_tokens, ingress_at, caller_deadline)
-            })
+            .classify_with(self.queue.classify_request(
+                request,
+                input_tokens,
+                ingress_at,
+                caller_deadline,
+            ))
             .await
             .map(Some)
             .inspect_err(|error| {

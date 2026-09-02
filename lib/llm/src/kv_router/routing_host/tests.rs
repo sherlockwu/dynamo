@@ -900,7 +900,7 @@ impl RequestClassifier for RecordingClassifier {
         Box::pin(async move { Ok(request) })
     }
 
-    async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+    async fn on_event(&mut self, event: ClassifyEvent) {
         let observation = match event {
             ClassifyEvent::Completed {
                 context_tokens: Some(context_tokens),
@@ -926,7 +926,6 @@ fn classification_failures_are_not_affinity_retryable() {
         KvSchedulerError::RequestClassifierFailed(
             std::sync::Arc::new(ClassifierRejected) as std::sync::Arc<ClassifierError>
         ),
-        KvSchedulerError::RequestClassifierReplacedRequest,
         KvSchedulerError::DuplicateClassificationRequestId("request".to_string()),
         KvSchedulerError::InvalidClassificationMetadata("metadata".to_string()),
     ];
@@ -949,7 +948,7 @@ impl RequestClassifier for RejectingClassifier {
         Box::pin(async { Err(Box::new(ClassifierRejected) as Box<ClassifierError>) })
     }
 
-    async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+    async fn on_event(&mut self, event: ClassifyEvent) {
         if let ClassifyEvent::Aborted { error, .. } = event {
             self.observations
                 .send(error.map(|error| {
@@ -1070,13 +1069,13 @@ async fn query_only_selection_bypasses_classifier_and_request_lifecycle() {
     runtime.shutdown();
 }
 
-struct ThunderAgentPauseClassifier {
+struct PausingClassifier {
     paused: Arc<AtomicBool>,
     entered: Arc<Notify>,
     resumed: Arc<Notify>,
 }
 
-impl RequestClassifier for ThunderAgentPauseClassifier {
+impl RequestClassifier for PausingClassifier {
     fn classify(&mut self, request: ClassifyRequest) -> ClassifyFuture {
         let paused = Arc::clone(&self.paused);
         let entered = Arc::clone(&self.entered);
@@ -1092,12 +1091,12 @@ impl RequestClassifier for ThunderAgentPauseClassifier {
 }
 
 #[tokio::test]
-async fn thunder_agent_shaped_classifier_pauses_and_resumes_admission() {
+async fn classifier_pause_defers_admission_until_resumed() {
     let paused = Arc::new(AtomicBool::new(true));
     let entered = Arc::new(Notify::new());
     let resumed = Arc::new(Notify::new());
     let (router, runtime) = router_with_classifier(
-        ThunderAgentPauseClassifier {
+        PausingClassifier {
             paused: Arc::clone(&paused),
             entered: Arc::clone(&entered),
             resumed: Arc::clone(&resumed),
@@ -1142,7 +1141,7 @@ impl RequestClassifier for TokenContractClassifier {
         Box::pin(async move { Ok(request) })
     }
 
-    async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+    async fn on_event(&mut self, event: ClassifyEvent) {
         if let ClassifyEvent::Completed {
             context_tokens: Some(context_tokens),
             ..

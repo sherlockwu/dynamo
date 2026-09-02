@@ -74,7 +74,6 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
         KvSchedulerError::BookingFailed(_) => StatusCode::CONFLICT,
         KvSchedulerError::RequestClassifierPanicked(_)
         | KvSchedulerError::RequestClassifierFailed(_)
-        | KvSchedulerError::RequestClassifierReplacedRequest
         | KvSchedulerError::DuplicateClassificationRequestId(_)
         | KvSchedulerError::InvalidClassificationMetadata(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

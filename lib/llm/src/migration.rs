@@ -546,12 +546,7 @@ where
                             frontend_service::migration_outcome::FAILURE,
                         );
                         if let Some(state) = self.request.migration_state.as_ref() {
-                            let typed_error = err
-                                .chain()
-                                .find_map(|cause| cause.downcast_ref::<DynamoError>());
-                            state.abort_request_lifecycle(typed_error.map(|error| {
-                                error as &dynamo_kv_router::scheduling::ClassifierError
-                            }));
+                            state.abort_request_lifecycle(Some(err.as_ref()));
                         }
                         return Err(err);
                     }
@@ -567,14 +562,7 @@ where
                         };
                     self.record_migration_outcome(migration_event.as_ref(), outcome);
                     if let Some(state) = self.request.migration_state.as_ref() {
-                        let typed_error = err
-                            .chain()
-                            .find_map(|cause| cause.downcast_ref::<DynamoError>());
-                        state.abort_request_lifecycle(
-                            typed_error.map(|error| {
-                                error as &dynamo_kv_router::scheduling::ClassifierError
-                            }),
-                        );
+                        state.abort_request_lifecycle(Some(err.as_ref()));
                     }
                     return Err(err);
                 }

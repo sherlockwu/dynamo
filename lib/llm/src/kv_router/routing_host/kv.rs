@@ -524,7 +524,7 @@ where
                 let typed_error = error
                     .chain()
                     .find_map(|cause| cause.downcast_ref::<DynamoError>().cloned());
-                guard.record_migration_failure(typed_error.clone());
+                guard.record_migration_failure(typed_error);
                 if !crate::migration::is_migratable(error.as_ref())
                     || !guard.release_for_retry().await
                 {
@@ -600,7 +600,6 @@ where
             Ok(metadata) => metadata,
             Err(error) => {
                 guard.abort_with_error(Some(error.as_ref())).await;
-                invalidate_on_non_cancellation(&mut operation, &error);
                 return Err(error);
             }
         };

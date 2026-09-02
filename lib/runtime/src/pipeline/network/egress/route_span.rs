@@ -234,11 +234,13 @@ fn error_outcome(error_type: ErrorType) -> &'static str {
         ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument) => {
             "rejected"
         }
-        ErrorType::DeadlineExceeded
-        | ErrorType::ResourceExhausted
-        | ErrorType::WorkerOverloaded => "rejected",
+        ErrorType::ResourceExhausted | ErrorType::WorkerOverloaded => "rejected",
         ErrorType::Unavailable => "unavailable",
-        ErrorType::Cancelled | ErrorType::Backend(BackendError::Cancelled) => "cancelled",
+        // Deadline expiry matches the HTTP metric classification, which labels
+        // deadline-exceeded 429 responses as `cancelled`.
+        ErrorType::DeadlineExceeded
+        | ErrorType::Cancelled
+        | ErrorType::Backend(BackendError::Cancelled) => "cancelled",
         ErrorType::Unknown | ErrorType::Backend(BackendError::Unknown) => "error",
     }
 }
@@ -515,12 +517,12 @@ mod tests {
     }
 
     #[test]
-    fn deadline_exceeded_is_a_rejected_route_outcome() {
+    fn deadline_exceeded_is_a_cancelled_route_outcome() {
         assert_eq!(
             error_type_name(ErrorType::DeadlineExceeded),
             "deadline_exceeded"
         );
-        assert_eq!(error_outcome(ErrorType::DeadlineExceeded), "rejected");
+        assert_eq!(error_outcome(ErrorType::DeadlineExceeded), "cancelled");
     }
 
     #[tokio::test]

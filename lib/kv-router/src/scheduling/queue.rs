@@ -19,7 +19,7 @@ use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
 };
 use super::policy_config::{PolicyClassConfig, PolicyProfile};
-use super::policy_queue::{PolicyQueue, QueueSnapshot};
+use super::policy_queue::{PolicyQueue, QueueMetadata, QueueSnapshot};
 use super::prefill_load::{PrefillLoadEstimator, effective_prefill_tokens};
 use super::queue_admission::WorkerPlacement;
 use super::request_classifier::ClassifyRequest;
@@ -91,16 +91,8 @@ struct QueuedRequest {
     attempt_tx: Option<oneshot::Sender<AttemptId>>,
     lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
     enqueue_at: Instant,
-    due_at: Option<Instant>,
+    due_at: Option<StdInstant>,
     block_hashes: Option<Vec<LocalBlockHash>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QueueMetadata {
-    class_index: usize,
-    snapshot: QueueSnapshot,
-    due_at: Option<Instant>,
-    arrival_offset_secs: f64,
 }
 
 struct SelectedWorkerForRequest {
@@ -779,7 +771,6 @@ impl<
         block_hashes: Option<Vec<LocalBlockHash>>,
         lease: Option<Box<RequestLifecycleLease>>,
     ) -> Option<Box<RequestLifecycleLease>> {
-        self.record_received();
         self.enqueue_admitted_with_block_hashes_and_lease(
             request,
             block_hashes,
@@ -791,7 +782,6 @@ impl<
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn enqueue_admitted_with_block_hashes_and_lease(
         &self,
         mut request: SchedulingRequest,
@@ -801,6 +791,7 @@ impl<
         classified_request: Option<ClassifyRequest>,
         ingress_at: StdInstant,
     ) -> Option<Box<RequestLifecycleLease>> {
+        self.record_received();
         if self.queueing_enabled && lease.is_none() && request.mode.lifecycle_request_id().is_some()
         {
             request.respond(Err(KvSchedulerError::BookingFailed(
@@ -898,11 +889,7 @@ impl<
         );
         let class_index = self
             .profile
-            .direct_class_index(request.policy_class.as_deref())
-            .unwrap_or_else(|| {
-                self.profile
-                    .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens)
-            });
+            .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens);
         QueueMetadata {
             class_index,
             snapshot,
@@ -959,7 +946,7 @@ impl<
         Ok(QueueMetadata {
             class_index,
             snapshot,
-            due_at: due_at.map(Instant::from_std),
+            due_at,
             arrival_offset_secs: ingress_at
                 .saturating_duration_since(self.start_time)
                 .as_secs_f64(),
@@ -1281,18 +1268,14 @@ impl<
         let decay_now = Instant::now();
         if queue_metadata
             .due_at
-            .is_some_and(|due_at| due_at <= decay_now)
+            .is_some_and(|due_at| due_at <= decay_now.into_std())
         {
             self.admission_counters.record_due_time_passed();
             request.respond(Err(KvSchedulerError::DueTimeExpired));
             return false;
         }
-        let QueueMetadata {
-            class_index,
-            snapshot,
-            due_at,
-            arrival_offset_secs,
-        } = queue_metadata;
+        let class_index = queue_metadata.class_index;
+        let snapshot = queue_metadata.snapshot;
         let class = self.profile.class(class_index);
         tracing::debug!(policy_class = class.name, "ordering request");
         let priority_jump = request.priority_jump;
@@ -1305,18 +1288,15 @@ impl<
             attempt_tx,
             lifecycle_transfer: lifecycle_transfer.clone(),
             enqueue_at: decay_now,
-            due_at,
+            due_at: queue_metadata.due_at,
             block_hashes,
         };
         let worker_count = self.workers_with_configs.borrow().len();
         if let Err((rejection, queued)) = self.pending.enqueue_with_due_at(
-            class_index,
+            queue_metadata,
             worker_count,
-            snapshot,
-            arrival_offset_secs,
             priority_jump,
             strict_priority,
-            due_at.map(Instant::into_std),
             placement,
             queued,
         ) {
@@ -1334,11 +1314,9 @@ impl<
         true
     }
 
-    fn reject_expired(&mut self, now: Instant) {
-        for entry in self.pending.take_expired(now.into_std()) {
-            self.admission_counters
-                .due_time_passed
-                .fetch_add(1, AtomicOrdering::Relaxed);
+    fn reject_expired(&mut self, now: StdInstant) {
+        for entry in self.pending.take_expired(now) {
+            self.admission_counters.record_due_time_passed();
             let class_index = entry.class_index();
             self.subtract_pending_counters(class_index, entry.snapshot());
             let mut request = entry.into_payload().request;
@@ -1472,7 +1450,7 @@ impl<
     }
 
     async fn handle_update(&mut self, worker: Option<WorkerWithDpRank>) {
-        self.reject_expired(Instant::now());
+        self.reject_expired(Instant::now().into_std());
         if !self.pending.has_ready() {
             return;
         }
@@ -1538,10 +1516,11 @@ impl<
                 decay_now,
             )
             .await;
-            if queued.due_at.is_some_and(|due_at| due_at <= Instant::now()) {
-                self.admission_counters
-                    .due_time_passed
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+            if queued
+                .due_at
+                .is_some_and(|due_at| due_at <= Instant::now().into_std())
+            {
+                self.admission_counters.record_due_time_passed();
                 let mut request = popped.into_payload().request;
                 request.respond(Err(KvSchedulerError::DueTimeExpired));
                 continue;
@@ -2600,20 +2579,14 @@ policy_classes:
             "bulk_cached"
         );
         assert_eq!(metadata.snapshot.scheduling_cost_tokens, 7);
-        assert_eq!(
-            metadata.due_at.map(Instant::into_std),
-            Some(caller_deadline)
-        );
+        assert_eq!(metadata.due_at, Some(caller_deadline));
         let mut order = PolicyQueue::new(queue.profile.clone());
         order
             .enqueue_with_due_at(
-                metadata.class_index,
+                metadata,
                 1,
-                metadata.snapshot,
-                metadata.arrival_offset_secs,
                 request.priority_jump,
                 request.strict_priority,
-                metadata.due_at.map(Instant::into_std),
                 WorkerPlacement::Any,
                 (),
             )
@@ -2662,7 +2635,6 @@ policy_classes:
         let mut classified =
             queue.classify_request(&classify_source(&queued), 64, ingress_at, None);
         classified.set_due_at(ingress_at + Duration::from_secs(1));
-        queue.record_received();
         queue
             .enqueue_admitted_with_block_hashes_and_lease(
                 queued,

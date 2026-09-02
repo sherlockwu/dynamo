@@ -46,8 +46,7 @@ For how queue backpressure differs from candidate filtering and busy-threshold o
 YAML accept only `fcfs` and `wspt`.
 
 For each policy, the complete pending-queue key is
-`(strict_priority, due_at, policy_key)`. Higher strict tiers always win; a classifier-provided
-due time breaks ties within a tier before the selected policy orders requests.
+`(strict_priority, due_at, policy_key)`. Higher strict tiers always win; within a tier, every request with a classifier-provided due time is scheduled ahead of every request without one (an unset due time sorts last) before the selected policy orders requests, so sustained deadline-bearing traffic can starve non-deadline requests in the same class.
 
 ### Policy-Class Queues
 
