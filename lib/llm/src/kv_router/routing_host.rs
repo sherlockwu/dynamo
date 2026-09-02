@@ -127,8 +127,17 @@ where
                         guard.record_migration_failure(item.error.clone());
                         // Release the failed attempt before Migration can observe
                         // the item and start another one. This keeps serialized
-                        // retries free of stale-cleanup ABA races.
-                        guard.abort().await;
+                        // retries free of stale-cleanup ABA races. A migratable
+                        // failure hands the classifier lifecycle to the retry,
+                        // exactly like a dispatch-time failure; anything else is
+                        // terminal for the logical request and aborts it here.
+                        let migratable = item
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| crate::migration::is_migratable(error));
+                        if !migratable || !guard.release_for_retry().await {
+                            guard.abort().await;
+                        }
                         yield item;
                         break false;
                     }

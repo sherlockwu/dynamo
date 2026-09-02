@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::policy_queue::QueueSnapshot;
@@ -233,6 +234,9 @@ pub(crate) struct RequestClassifierRuntime {
     // plugin bookkeeping and grows this queue.
     events: mpsc::UnboundedSender<ClassifyEvent>,
     shutdown: CancellationToken,
+    // Aborted on drop as a backstop for a shutdown token that never fires
+    // while `on_event` is stuck.
+    delivery: JoinHandle<()>,
 }
 
 impl RequestClassifierRuntime {
@@ -246,7 +250,7 @@ impl RequestClassifierRuntime {
         let classifier = Arc::new(AsyncMutex::new(classifier));
         let delivery_classifier = Arc::clone(&classifier);
         let delivery_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        let delivery = tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
                     biased;
@@ -256,11 +260,21 @@ impl RequestClassifierRuntime {
                         None => break,
                     },
                 };
-                let mut classifier = delivery_classifier.lock().await;
-                if let Err(panic) = AssertUnwindSafe(classifier.on_event(event))
-                    .catch_unwind()
-                    .await
-                {
+                // Shutdown must also interrupt a stuck `on_event`, not just
+                // fire between events: dropping this branch releases the
+                // classifier lock so callers queued on it can observe
+                // shutdown instead of hanging.
+                let delivered = tokio::select! {
+                    biased;
+                    _ = delivery_shutdown.cancelled() => break,
+                    delivered = async {
+                        let mut classifier = delivery_classifier.lock().await;
+                        AssertUnwindSafe(classifier.on_event(event))
+                            .catch_unwind()
+                            .await
+                    } => delivered,
+                };
+                if let Err(panic) = delivered {
                     tracing::error!(
                         panic = %panic_message(panic),
                         "Request classifier panicked while processing a lifecycle event"
@@ -273,6 +287,7 @@ impl RequestClassifierRuntime {
             live_requests: Mutex::new(HashMap::new()),
             events,
             shutdown,
+            delivery,
         })
     }
 
@@ -360,9 +375,27 @@ impl RequestClassifierRuntime {
         let _ = self.events.send(event);
     }
 
-    /// Remove the request from the live set; returns whether it was live.
-    fn finish_request(&self, request_id: &str) -> bool {
-        self.live_requests.lock().remove(request_id).is_some()
+    /// Remove the request from the live set and, if it was live, enqueue its
+    /// terminal event before releasing the lock (the unbounded send cannot
+    /// block). `begin_request` re-registers a reused id under the same lock,
+    /// so the terminal event is always ordered ahead of any event from the
+    /// id's next lifecycle.
+    fn finish_request_and_send(
+        &self,
+        request_id: String,
+        event: impl FnOnce(String) -> ClassifyEvent,
+    ) {
+        let mut live_requests = self.live_requests.lock();
+        if live_requests.remove(&request_id).is_none() {
+            return;
+        }
+        let _ = self.events.send(event(request_id));
+    }
+}
+
+impl Drop for RequestClassifierRuntime {
+    fn drop(&mut self) {
+        self.delivery.abort();
     }
 }
 
@@ -458,14 +491,15 @@ impl RequestLifecycle {
             return;
         };
         self.phase = LifecyclePhase::Terminal;
-        if !self.runtime.finish_request(&self.request_id) {
-            return;
-        }
-        self.runtime.send_event(ClassifyEvent::Completed {
-            request_id: std::mem::take(&mut self.request_id),
-            worker,
-            context_tokens: self.context_tokens,
-        });
+        let context_tokens = self.context_tokens;
+        self.runtime
+            .finish_request_and_send(std::mem::take(&mut self.request_id), |request_id| {
+                ClassifyEvent::Completed {
+                    request_id,
+                    worker,
+                    context_tokens,
+                }
+            });
     }
 
     pub fn abort(&mut self, error: Option<Arc<AbortCause>>) {
@@ -473,14 +507,15 @@ impl RequestLifecycle {
             return;
         }
         self.phase = LifecyclePhase::Terminal;
-        if !self.runtime.finish_request(&self.request_id) {
-            return;
-        }
-        self.runtime.send_event(ClassifyEvent::Aborted {
-            request_id: std::mem::take(&mut self.request_id),
-            worker: self.worker,
-            error,
-        });
+        let worker = self.worker;
+        self.runtime
+            .finish_request_and_send(std::mem::take(&mut self.request_id), |request_id| {
+                ClassifyEvent::Aborted {
+                    request_id,
+                    worker,
+                    error,
+                }
+            });
     }
 }
 
@@ -913,5 +948,95 @@ mod tests {
             ))
         );
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_event_is_ordered_before_events_from_a_reused_request_id() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let runtime = RequestClassifierRuntime::new(
+            Box::new(RecordingClassifier { events: event_tx }),
+            CancellationToken::new(),
+        );
+        let worker = WorkerWithDpRank::new(1, 0);
+
+        for _ in 0..4096 {
+            let mut lifecycle = runtime.begin_request("reused").unwrap();
+            lifecycle.sent(worker);
+
+            // Race a re-registration of the client-controlled id against
+            // `complete`, grabbing it the instant it is released.
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let reuse_attempts = Arc::clone(&attempts);
+            let reuse_runtime = Arc::clone(&runtime);
+            let reuse = std::thread::spawn(move || {
+                let mut reused = loop {
+                    reuse_attempts.fetch_add(1, Ordering::Relaxed);
+                    match reuse_runtime.begin_request("reused") {
+                        Ok(lifecycle) => break lifecycle,
+                        Err(_) => std::hint::spin_loop(),
+                    }
+                };
+                reused.sent(worker);
+                reused
+            });
+            while attempts.load(Ordering::Relaxed) == 0 {
+                std::thread::yield_now();
+            }
+            lifecycle.complete();
+            let reused = reuse.join().unwrap();
+
+            assert_eq!(
+                event_rx.recv().await,
+                Some(RecordedEvent::Sent("reused".to_string(), worker))
+            );
+            assert_eq!(
+                event_rx.recv().await,
+                Some(RecordedEvent::Completed("reused".to_string(), worker, None)),
+                "terminal event for the released id must precede the reused id's Sent"
+            );
+            assert_eq!(
+                event_rx.recv().await,
+                Some(RecordedEvent::Sent("reused".to_string(), worker))
+            );
+            drop(reused);
+            assert_eq!(
+                event_rx.recv().await,
+                Some(RecordedEvent::Aborted("reused".to_string(), Some(worker)))
+            );
+        }
+    }
+
+    struct StuckOnEventClassifier {
+        entered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RequestClassifier for StuckOnEventClassifier {
+        async fn on_event(&mut self, _event: ClassifyEvent) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_stuck_on_event_and_releases_classifier_lock() {
+        let entered = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
+        let runtime = RequestClassifierRuntime::new(
+            Box::new(StuckOnEventClassifier {
+                entered: Arc::clone(&entered),
+            }),
+            shutdown.clone(),
+        );
+        let mut lifecycle = runtime.begin_request("stuck").unwrap();
+        lifecycle.sent(WorkerWithDpRank::new(1, 0));
+        // The callback now holds the classifier lock and never returns.
+        entered.notified().await;
+
+        shutdown.cancel();
+        let _guard =
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.classifier.lock())
+                .await
+                .expect("shutdown did not release the classifier lock held by on_event");
     }
 }

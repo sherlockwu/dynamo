@@ -428,7 +428,11 @@ where
                 migration_event.as_ref(),
                 frontend_service::migration_outcome::FAILURE,
             );
-            return Err(Error::msg("Migration limit exhausted"));
+            let error = Error::msg("Migration limit exhausted");
+            if let Some(state) = self.request.migration_state.as_ref() {
+                state.abort_request_lifecycle(Some(error.as_ref()));
+            }
+            return Err(error);
         }
         while self.retries_left > 0 {
             self.retries_left -= 1;

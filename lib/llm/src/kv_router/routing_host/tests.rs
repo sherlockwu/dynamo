@@ -2048,9 +2048,23 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>> for Reje
     }
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn worker_overload_stream_migration_releases_and_reselects() {
+/// Two shared-store workers behind a [`RejectFirstDispatch`], exposed as the
+/// engine a [`Migration`] layer dispatches through.
+struct StreamMigrationHarness {
+    runtime: Runtime,
+    chooser: Arc<KvRouter>,
+    dispatch: Arc<RejectFirstDispatch>,
+    registered_ids: HashSet<u64>,
+    engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    _workers_tx: watch::Sender<HashMap<u64, ModelRuntimeConfig>>,
+    _drts: [DistributedRuntime; 3],
+    _store: tempfile::TempDir,
+}
+
+async fn stream_migration_harness(
+    namespace: &str,
+    classifier: Option<RecordingClassifier>,
+) -> StreamMigrationHarness {
     async fn shared_drt(runtime: Runtime, store_path: &std::path::Path) -> DistributedRuntime {
         DistributedRuntime::new(
             runtime,
@@ -2072,7 +2086,6 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
     let router_drt = shared_drt(runtime.clone(), store.path()).await;
     let first_worker_drt = shared_drt(runtime.clone(), store.path()).await;
     let second_worker_drt = shared_drt(runtime.clone(), store.path()).await;
-    let namespace = "worker-overload-migration";
     let endpoint_for = |drt: &DistributedRuntime| {
         drt.namespace(namespace.to_string())
             .unwrap()
@@ -2124,7 +2137,7 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
         router_track_active_blocks: false,
         ..Default::default()
     };
-    let chooser = KvRouter::new_with_worker_role_and_scheduler_load(
+    let mut chooser = KvRouter::new_with_worker_role_and_scheduler_load(
         endpoint,
         client.clone(),
         workers,
@@ -2144,13 +2157,16 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
     )
     .await
     .unwrap();
+    if let Some(classifier) = classifier {
+        chooser = chooser.with_request_classifier(classifier).unwrap();
+    }
     let dispatch = Arc::new(RejectFirstDispatch::default());
     let push_router =
         PushRouter::from_client_with_dispatch(client.clone(), RouterMode::KV, dispatch.clone())
             .await
             .unwrap();
     let chooser = Arc::new(chooser);
-    let kv_router = Arc::new(
+    let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> = Arc::new(
         RoutingHost::new_with_load_context(
             push_router,
             chooser.clone(),
@@ -2160,11 +2176,26 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
         )
         .unwrap(),
     );
-    let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> = kv_router;
+    StreamMigrationHarness {
+        runtime,
+        chooser,
+        dispatch,
+        registered_ids,
+        engine,
+        _workers_tx,
+        _drts: [router_drt, first_worker_drt, second_worker_drt],
+        _store: store,
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn worker_overload_stream_migration_releases_and_reselects() {
+    let harness = stream_migration_harness("worker-overload-migration", None).await;
     let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
 
     let responses: Vec<_> = migration
-        .generate(Context::new(request()), next)
+        .generate(Context::new(request()), harness.engine.clone())
         .await
         .unwrap()
         .collect()
@@ -2174,18 +2205,19 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
     assert!(responses[0].error.is_none());
     assert_eq!(responses[0].data.as_ref().unwrap().token_ids, vec![2]);
     let attempts = {
-        let attempts = dispatch.attempts.lock().unwrap();
+        let attempts = harness.dispatch.attempts.lock().unwrap();
         attempts.clone()
     };
     assert_eq!(attempts.len(), 2);
     let failed_worker = attempts[0].0;
     let retried_worker = attempts[1].0;
     assert_ne!(failed_worker, retried_worker);
-    assert!(registered_ids.contains(&failed_worker));
-    assert!(registered_ids.contains(&retried_worker));
+    assert!(harness.registered_ids.contains(&failed_worker));
+    assert!(harness.registered_ids.contains(&retried_worker));
     assert!(attempts[0].1.is_empty());
     assert_eq!(attempts[1].1, vec![failed_worker]);
-    let loads = chooser
+    let loads = harness
+        .chooser
         .get_potential_loads(&[], None, None, None, None)
         .await
         .unwrap();
@@ -2193,5 +2225,53 @@ async fn worker_overload_stream_migration_releases_and_reselects() {
         loads.iter().all(|load| load.active_requests == 0),
         "all scheduler bookings must be released after migration: {loads:?}"
     );
-    runtime.shutdown();
+    harness.runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stream_migration_retry_continues_one_classifier_lifecycle() {
+    let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();
+    let harness = stream_migration_harness(
+        "stream-migration-classifier-lifecycle",
+        Some(RecordingClassifier {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observations: observations_tx,
+        }),
+    )
+    .await;
+    let migration = Migration::new(1, None, "test".to_string(), Arc::new(Metrics::new()));
+
+    let responses: Vec<_> = migration
+        .generate(Context::new(request()), harness.engine.clone())
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].error.is_none());
+    let attempts = {
+        let attempts = harness.dispatch.attempts.lock().unwrap();
+        attempts.clone()
+    };
+    assert_eq!(attempts.len(), 2, "the failed stream must be retried once");
+    assert_ne!(attempts[0].0, attempts[1].0);
+
+    // The retry continues the failed attempt's lifecycle, so the plugin must
+    // see exactly one terminal event for the logical request: the retry's
+    // Completed, with no Aborted from the failed stream before it.
+    let observation = tokio::time::timeout(Duration::from_secs(1), observations_rx.recv())
+        .await
+        .expect("classifier terminal event timed out")
+        .expect("classifier event channel closed");
+    assert!(
+        matches!(observation, ClassifierObservation::Completed(_)),
+        "the failed stream must not abort the lifecycle Migration retries: {observation:?}"
+    );
+    assert!(
+        observations_rx.try_recv().is_err(),
+        "the logical request must emit exactly one terminal lifecycle event"
+    );
+    harness.runtime.shutdown();
 }
