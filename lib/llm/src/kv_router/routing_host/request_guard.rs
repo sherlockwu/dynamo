@@ -26,7 +26,7 @@ use dynamo_kv_router::{
         BlockExtraInfo, BlockHashOptions, WorkerWithDpRank, compute_block_hash_for_seq,
         compute_next_seq_hash,
     },
-    scheduling::{AdmissionAttempt, ClassifierError, RequestLifecycle},
+    scheduling::{AbortCause, AdmissionAttempt, RequestLifecycle},
     selector::WorkerSelector,
 };
 use dynamo_runtime::{
@@ -387,6 +387,9 @@ where
     worker: WorkerWithDpRank,
     approximate_lru: Option<ApproximateRequestLease>,
     lifecycle: Option<RequestAttemptLease>,
+    /// Classifier lifecycle for this attempt. Living here keeps it structurally
+    /// tied to KV routing: builtin and occupancy cleanups cannot hold one.
+    request_lifecycle: Option<Box<RequestLifecycle>>,
 }
 
 impl<Sel> KvRequestCleanup<Sel>
@@ -428,6 +431,7 @@ where
             worker,
             approximate_lru,
             lifecycle,
+            request_lifecycle: None,
         }
     }
 
@@ -506,6 +510,20 @@ where
         }
     }
 
+    fn request_lifecycle_mut(&mut self) -> Option<&mut RequestLifecycle> {
+        match self {
+            Self::Kv(cleanup) => cleanup.request_lifecycle.as_deref_mut(),
+            Self::Stateless { .. } | Self::Occupancy { .. } => None,
+        }
+    }
+
+    fn take_request_lifecycle(&mut self) -> Option<Box<RequestLifecycle>> {
+        match self {
+            Self::Kv(cleanup) => cleanup.request_lifecycle.take(),
+            Self::Stateless { .. } | Self::Occupancy { .. } => None,
+        }
+    }
+
     async fn finish(&mut self) {
         match self {
             Self::Kv(cleanup) => cleanup.finish().await,
@@ -566,7 +584,6 @@ where
     record_itl_at_completion: bool,
     prefill_marked: bool,
     migration_state: Option<MigrationState>,
-    request_lifecycle: Option<Box<RequestLifecycle>>,
     _lora_load: Option<LoraLoadGuard>,
 }
 
@@ -593,16 +610,17 @@ where
 
     pub(super) fn new_kv_with_cleanup(
         request_metrics: Arc<RouterRequestMetrics>,
-        cleanup: KvRequestCleanup<Sel>,
+        mut cleanup: KvRequestCleanup<Sel>,
         request: &PreprocessedRequest,
         mut request_lifecycle: Option<Box<RequestLifecycle>>,
     ) -> Self {
-        let chooser = &cleanup.chooser;
-        let block_size = chooser.block_size() as usize;
-        let isl_tokens = request.token_ids.len();
         if let Some(lifecycle) = request_lifecycle.as_mut() {
             lifecycle.observe_context_tokens(request.input_token_count());
         }
+        cleanup.request_lifecycle = request_lifecycle;
+        let chooser = &cleanup.chooser;
+        let block_size = chooser.block_size() as usize;
+        let isl_tokens = request.token_ids.len();
         let expected_output_tokens = request
             .routing
             .as_ref()
@@ -633,7 +651,6 @@ where
             record_itl_at_completion: false,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
-            request_lifecycle,
             _lora_load: None,
         }
     }
@@ -663,7 +680,6 @@ where
             record_itl_at_completion: true,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
-            request_lifecycle: None,
             _lora_load: lora_load,
         }
     }
@@ -692,11 +708,11 @@ where
 
     pub(super) fn mark_dispatched(&mut self) {
         self.observability.mark_dispatched();
-        if let Some(lifecycle) = self.request_lifecycle.as_mut() {
-            let RequestCleanup::Kv(cleanup) = &self.cleanup else {
-                unreachable!("request-classifier lifecycle belongs to KV routing");
-            };
-            lifecycle.sent(cleanup.worker);
+        if let RequestCleanup::Kv(cleanup) = &mut self.cleanup {
+            let worker = cleanup.worker;
+            if let Some(lifecycle) = cleanup.request_lifecycle.as_mut() {
+                lifecycle.sent(worker);
+            }
         }
     }
 
@@ -736,7 +752,7 @@ where
         {
             lifecycle.touch();
         }
-        if let Some(lifecycle) = self.request_lifecycle.as_mut() {
+        if let Some(lifecycle) = self.cleanup.request_lifecycle_mut() {
             lifecycle.responding();
             lifecycle.observe_output_tokens(new_tokens);
             if let Some(total_tokens) = item
@@ -821,7 +837,7 @@ where
     }
 
     pub(super) async fn finish(&mut self) {
-        if let Some(lifecycle) = self.request_lifecycle.as_mut() {
+        if let Some(lifecycle) = self.cleanup.request_lifecycle_mut() {
             lifecycle.complete();
         }
         // Metrics must observe the completed request before cleanup releases its state.
@@ -838,7 +854,7 @@ where
         let Some(migration_state) = self.migration_state.as_ref() else {
             return false;
         };
-        let Some(mut lifecycle) = self.request_lifecycle.take() else {
+        let Some(mut lifecycle) = self.cleanup.take_request_lifecycle() else {
             return false;
         };
         lifecycle.prepare_retry();
@@ -847,8 +863,8 @@ where
         true
     }
 
-    pub(super) async fn abort_with_error(&mut self, error: Option<&ClassifierError>) {
-        if let Some(lifecycle) = self.request_lifecycle.as_mut() {
+    pub(super) async fn abort_with_error(&mut self, error: Option<&AbortCause>) {
+        if let Some(lifecycle) = self.cleanup.request_lifecycle_mut() {
             lifecycle.abort(error.map(crate::protocols::common::preprocessor::owned_abort_error));
         }
         self.cleanup.finish().await;

@@ -10,7 +10,7 @@ use std::{
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
-    scheduling::{ClassifierError, KvSchedulerError},
+    scheduling::{AbortCause, KvSchedulerError},
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -76,7 +76,6 @@ fn classification_failure(error: &Error) -> Option<&KvSchedulerError> {
             error,
             KvSchedulerError::RequestClassifierPanicked(_)
                 | KvSchedulerError::RequestClassifierFailed(_)
-                | KvSchedulerError::RequestClassifierReplacedRequest
                 | KvSchedulerError::DuplicateClassificationRequestId(_)
                 | KvSchedulerError::InvalidClassificationMetadata(_)
         )
@@ -84,19 +83,10 @@ fn classification_failure(error: &Error) -> Option<&KvSchedulerError> {
     })
 }
 
-fn classifier_abort_error(error: &KvSchedulerError) -> Arc<ClassifierError> {
+fn classifier_abort_error(error: &KvSchedulerError) -> Arc<AbortCause> {
     match error {
         KvSchedulerError::RequestClassifierFailed(source) => Arc::clone(source),
         _ => owned_abort_error(error),
-    }
-}
-
-fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error: &Error) {
-    if is_cancelled(error) {
-        return;
-    }
-    if let Some(operation) = operation.take() {
-        operation.invalidate();
     }
 }
 
@@ -137,8 +127,17 @@ where
                         guard.record_migration_failure(item.error.clone());
                         // Release the failed attempt before Migration can observe
                         // the item and start another one. This keeps serialized
-                        // retries free of stale-cleanup ABA races.
-                        guard.abort().await;
+                        // retries free of stale-cleanup ABA races. A migratable
+                        // failure hands the classifier lifecycle to the retry,
+                        // exactly like a dispatch-time failure; anything else is
+                        // terminal for the logical request and aborts it here.
+                        let migratable = item
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| crate::migration::is_migratable(error));
+                        if !migratable || !guard.release_for_retry().await {
+                            guard.abort().await;
+                        }
                         yield item;
                         break false;
                     }

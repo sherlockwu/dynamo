@@ -888,6 +888,8 @@ where
     }
 
     /// Attach a request classifier before placing this router into service.
+    // TODO: wire a production installer (Python bindings / router config); hidden until then.
+    #[doc(hidden)]
     pub fn with_request_classifier(self, classifier: impl RequestClassifier) -> Result<Self> {
         self.install_request_classifier_boxed(Box::new(classifier))?;
         Ok(self)
@@ -934,10 +936,6 @@ where
         request_id: &str,
     ) -> Result<Option<scheduling::RequestLifecycle>, KvSchedulerError> {
         self.scheduler.begin_request_lifecycle(request_id)
-    }
-
-    pub fn admission_counters(&self) -> AdmissionCounterSnapshot {
-        self.scheduler.admission_counters()
     }
 
     pub(crate) fn set_teardown_task_guard(
@@ -1433,8 +1431,6 @@ where
                 context_id,
                 Instant::now(),
                 tokens,
-                tokens.len(),
-                None,
                 block_mm_infos,
                 router_config_override,
                 update_states,
@@ -1488,8 +1484,6 @@ where
                 context_id,
                 Instant::now(),
                 tokens,
-                tokens.len(),
-                None,
                 block_mm_infos,
                 router_config_override,
                 false,
@@ -1522,8 +1516,6 @@ where
         context_id: Option<&str>,
         ingress_at: Instant,
         tokens: &[u32],
-        input_tokens: usize,
-        caller_deadline: Option<Instant>,
         block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
         router_config_override: Option<&RouterConfigOverride>,
         update_states: bool,
@@ -1684,12 +1676,7 @@ where
         let (response, attempt, selected_worker_load) = match admission {
             FindBestMatchAdmission::WithAdmission { .. } => match self
                 .scheduler
-                .schedule_request_admitted_with_context(
-                    schedule_request,
-                    input_tokens,
-                    ingress_at,
-                    caller_deadline,
-                )
+                .schedule_request_admitted_with_context(schedule_request, ingress_at)
                 .instrument(tracing::info_span!("kv_router.schedule"))
                 .await
             {

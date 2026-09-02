@@ -9,9 +9,9 @@ pub use dynamo_kv_router::scheduling::queue::{
     SchedulerBookingCleanup, SchedulerBookingDescriptor,
 };
 pub use dynamo_kv_router::scheduling::{
-    AdmissionCounterSnapshot, AdmittedSchedulingResponse, AdvisorySchedulingResponse, AttemptId,
-    KvSchedulerError, LocalScheduler, NonMaxOverlapSelectionObserver, OverloadedWorkerProvider,
-    PotentialLoad, ScheduleRequest, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
+    AdmittedSchedulingResponse, AdvisorySchedulingResponse, AttemptId, KvSchedulerError,
+    LocalScheduler, NonMaxOverlapSelectionObserver, OverloadedWorkerProvider, PotentialLoad,
+    ScheduleRequest, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
     WorkerAvailabilityProvider,
 };
 use dynamo_kv_router::scheduling::{RequestClassifier, RequestLifecycle};
@@ -285,23 +285,18 @@ where
     pub(crate) async fn schedule_request_admitted_with_context(
         &self,
         request: ScheduleRequest,
-        input_tokens: usize,
         ingress_at: Instant,
-        caller_deadline: Option<Instant>,
     ) -> Result<AdmittedSchedulingResponse, KvSchedulerError> {
         let response = self
             .inner
-            .schedule_request_admitted_with_context(
-                request,
-                input_tokens,
-                ingress_at,
-                caller_deadline,
-            )
+            .schedule_request_admitted_with_context(request, ingress_at)
             .await;
         self.observe_schedule_result(&response);
         response
     }
 
+    // TODO: wire a production installer (Python bindings / router config); hidden until then.
+    #[doc(hidden)]
     pub fn install_request_classifier(
         &self,
         classifier: Box<dyn RequestClassifier>,
@@ -315,10 +310,6 @@ where
         request_id: &str,
     ) -> Result<Option<RequestLifecycle>, KvSchedulerError> {
         self.inner.begin_request_lifecycle(request_id)
-    }
-
-    pub fn admission_counters(&self) -> AdmissionCounterSnapshot {
-        self.inner.admission_counters()
     }
 
     #[expect(clippy::too_many_arguments)]

@@ -60,7 +60,6 @@ impl SelectionOutcome {
 #[derive(Clone, Copy)]
 pub(super) struct RoutingRequestParts<'a> {
     pub(super) token_ids: &'a [TokenIdType],
-    pub(super) input_tokens: usize,
     pub(super) block_mm_infos: Option<&'a [Option<BlockExtraInfo>]>,
 }
 
@@ -69,7 +68,6 @@ impl<'a> RoutingRequestParts<'a> {
         let (token_ids, block_mm_infos) = request.block_mm_routing_info();
         Self {
             token_ids,
-            input_tokens: request.input_token_count(),
             block_mm_infos,
         }
     }
@@ -116,8 +114,6 @@ where
                 Some(args.context_id),
                 args.ingress_at,
                 args.routing_parts.token_ids,
-                args.routing_parts.input_tokens,
-                None,
                 args.routing_parts.block_mm_infos,
                 args.router_config_override,
                 args.update_states,

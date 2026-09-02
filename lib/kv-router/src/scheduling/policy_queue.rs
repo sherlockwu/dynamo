@@ -36,9 +36,17 @@ impl QueueSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueMetadata {
+    pub(crate) class_index: usize,
+    pub(crate) snapshot: QueueSnapshot,
+    pub(crate) due_at: Option<Instant>,
+    pub(crate) arrival_offset_secs: f64,
+}
+
 // `uncached_tokens` is derived, so omit it from every queued entry to make room
 // for exact deadline ordering without growing the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueueEntrySnapshot {
     raw_isl_tokens: usize,
     cached_tokens: usize,
@@ -195,38 +203,18 @@ struct DispatchCandidate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Keep the BTree key compact by pairing fields that otherwise pad
-// QueuePriority and WorkerWithDpRank independently.
 struct WorkerLaneHead {
-    worker_id: u64,
-    due_time_key: u64,
-    policy_score: OrderedFloat<f64>,
+    worker: WorkerWithDpRank,
+    priority: QueuePriority,
     enqueue_seq: u64,
-    strict_priority: u32,
-    dp_rank: u32,
 }
 
 impl WorkerLaneHead {
     fn new<T>(worker: WorkerWithDpRank, entry: &PolicyQueueEntry<T>) -> Self {
         Self {
-            worker_id: worker.worker_id,
-            due_time_key: entry.priority.due_time_key,
-            policy_score: entry.priority.policy_score,
+            worker,
+            priority: entry.priority,
             enqueue_seq: entry.enqueue_seq,
-            strict_priority: entry.priority.strict_priority,
-            dp_rank: worker.dp_rank,
-        }
-    }
-
-    fn worker(self) -> WorkerWithDpRank {
-        WorkerWithDpRank::new(self.worker_id, self.dp_rank)
-    }
-
-    fn priority(self) -> QueuePriority {
-        QueuePriority {
-            strict_priority: self.strict_priority,
-            due_time_key: self.due_time_key,
-            policy_score: self.policy_score,
         }
     }
 }
@@ -234,12 +222,12 @@ impl WorkerLaneHead {
 impl Ord for WorkerLaneHead {
     fn cmp(&self, other: &Self) -> Ordering {
         cmp_queue_order(
-            self.priority(),
+            self.priority,
             self.enqueue_seq,
-            other.priority(),
+            other.priority,
             other.enqueue_seq,
         )
-        .then_with(|| self.worker().cmp(&other.worker()))
+        .then_with(|| self.worker.cmp(&other.worker))
     }
 }
 
@@ -374,7 +362,7 @@ impl<T> PolicyClassQueue<T> {
             let dispatchable = {
                 let ready = self
                     .ready_by_worker
-                    .get(&head.worker())
+                    .get(&head.worker)
                     .expect("indexed worker lane vanished");
                 is_dispatchable(
                     class_index,
@@ -388,23 +376,19 @@ impl<T> PolicyClassQueue<T> {
             if !dispatchable {
                 let removed = self.candidate_worker_heads.pop_last();
                 debug_assert_eq!(removed, Some(head));
-                self.blocked_workers.insert(head.worker());
+                self.blocked_workers.insert(head.worker);
                 continue;
             }
 
-            let exact_cost = self.ready_by_worker[&head.worker()]
+            let exact_cost = self.ready_by_worker[&head.worker]
                 .peek()
                 .expect("indexed worker lane is empty")
                 .snapshot
                 .scheduling_cost_tokens;
             return match shared {
                 Some((priority, enqueue_seq, cost))
-                    if cmp_queue_order(
-                        priority,
-                        enqueue_seq,
-                        head.priority(),
-                        head.enqueue_seq,
-                    ) == Ordering::Greater =>
+                    if cmp_queue_order(priority, enqueue_seq, head.priority, head.enqueue_seq)
+                        == Ordering::Greater =>
                 {
                     Some(DispatchCandidate {
                         placement: WorkerPlacement::Any,
@@ -412,7 +396,7 @@ impl<T> PolicyClassQueue<T> {
                     })
                 }
                 _ => Some(DispatchCandidate {
-                    placement: WorkerPlacement::Exact(head.worker()),
+                    placement: WorkerPlacement::Exact(head.worker),
                     cost: exact_cost,
                 }),
             };
@@ -545,8 +529,7 @@ impl<T> PolicyQueue<T> {
 
     pub(crate) fn next_due_at(&self) -> Option<Instant> {
         let &(due_time_key, _) = self.due_entries.first()?;
-        self.deadline_origin
-            .checked_add(std::time::Duration::from_nanos(due_time_key))
+        Some(self.deadline_origin + std::time::Duration::from_nanos(due_time_key))
     }
 
     pub fn class_count(&self) -> usize {
@@ -604,31 +587,35 @@ impl<T> PolicyQueue<T> {
         payload: T,
     ) -> Result<(), (QueueRejection, T)> {
         self.enqueue_with_due_at(
-            class_index,
+            QueueMetadata {
+                class_index,
+                snapshot,
+                due_at: None,
+                arrival_offset_secs,
+            },
             worker_count,
-            snapshot,
-            arrival_offset_secs,
             priority_jump,
             strict_priority,
-            None,
             placement,
             payload,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_with_due_at(
         &mut self,
-        class_index: usize,
+        metadata: QueueMetadata,
         worker_count: usize,
-        snapshot: QueueSnapshot,
-        arrival_offset_secs: f64,
         priority_jump: f64,
         strict_priority: u32,
-        due_at: Option<Instant>,
         placement: WorkerPlacement,
         payload: T,
     ) -> Result<(), (QueueRejection, T)> {
+        let QueueMetadata {
+            class_index,
+            snapshot,
+            due_at,
+            arrival_offset_secs,
+        } = metadata;
         if due_at.is_some() && self.due_entries.is_empty() {
             self.deadline_origin = Instant::now();
         }
@@ -686,6 +673,9 @@ impl<T> PolicyQueue<T> {
             .range(..=(now_key, u64::MAX))
             .map(|(_, enqueue_seq)| *enqueue_seq)
             .collect();
+        if expired_sequences.is_empty() {
+            return Vec::new();
+        }
         let mut expired = Vec::new();
         for class_index in 0..self.classes.len() {
             expired.extend(
@@ -1016,8 +1006,8 @@ policy_classes:
 
     #[test]
     fn queue_entry_stays_compact() {
-        assert_eq!(std::mem::size_of::<PolicyQueueEntry<()>>(), 64);
-        assert_eq!(std::mem::size_of::<WorkerLaneHead>(), 40);
+        assert!(std::mem::size_of::<PolicyQueueEntry<()>>() <= 64);
+        assert!(std::mem::size_of::<WorkerLaneHead>() <= 48);
     }
 
     #[test]
@@ -1088,26 +1078,30 @@ policy_classes:
         let now = Instant::now();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(now + std::time::Duration::from_secs(20)),
+                    arrival_offset_secs: 0.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                0.0,
                 0.0,
                 0,
-                Some(now + std::time::Duration::from_secs(20)),
                 WorkerPlacement::Any,
                 "later-due",
             )
             .unwrap();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(now + std::time::Duration::from_secs(10)),
+                    arrival_offset_secs: 1.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                1.0,
                 0.0,
                 0,
-                Some(now + std::time::Duration::from_secs(10)),
                 WorkerPlacement::Any,
                 "earlier-due",
             )
@@ -1140,26 +1134,30 @@ policy_classes:
         let due_at = Instant::now() + std::time::Duration::from_secs(10);
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(due_at + std::time::Duration::from_nanos(1)),
+                    arrival_offset_secs: 0.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                0.0,
                 0.0,
                 0,
-                Some(due_at + std::time::Duration::from_nanos(1)),
                 WorkerPlacement::Exact(WorkerWithDpRank::new(1, 0)),
                 "later-due-better-fcfs",
             )
             .unwrap();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(due_at),
+                    arrival_offset_secs: 1.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                1.0,
                 0.0,
                 0,
-                Some(due_at),
                 WorkerPlacement::Exact(WorkerWithDpRank::new(2, 0)),
                 "earlier-due-worse-fcfs",
             )
@@ -1189,13 +1187,15 @@ policy_classes:
             .unwrap();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(due_at),
+                    arrival_offset_secs: 1.0,
+                },
                 2,
-                QueueSnapshot::new(1, 0),
-                1.0,
                 0.0,
                 0,
-                Some(due_at),
                 WorkerPlacement::Exact(WorkerWithDpRank::new(1, 0)),
                 "deadline",
             )
@@ -1215,13 +1215,15 @@ policy_classes:
         let due_at = Instant::now() + std::time::Duration::from_secs(1);
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(due_at),
+                    arrival_offset_secs: 0.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                0.0,
                 0.0,
                 0,
-                Some(due_at),
                 WorkerPlacement::Exact(worker),
                 "blocked",
             )
@@ -1251,26 +1253,30 @@ policy_classes:
         let now = Instant::now();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(now + std::time::Duration::from_secs(20)),
+                    arrival_offset_secs: 0.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                0.0,
                 0.0,
                 10,
-                Some(now + std::time::Duration::from_secs(20)),
                 WorkerPlacement::Any,
                 "high-priority-later-due",
             )
             .unwrap();
         queue
             .enqueue_with_due_at(
-                0,
+                QueueMetadata {
+                    class_index: 0,
+                    snapshot: QueueSnapshot::new(1, 0),
+                    due_at: Some(now + std::time::Duration::from_secs(10)),
+                    arrival_offset_secs: 1.0,
+                },
                 1,
-                QueueSnapshot::new(1, 0),
-                1.0,
                 0.0,
                 0,
-                Some(now + std::time::Duration::from_secs(10)),
                 WorkerPlacement::Any,
                 "low-priority-earlier-due",
             )

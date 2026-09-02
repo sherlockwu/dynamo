@@ -9,7 +9,7 @@ use dynamo_kv_router::{
     config::RouterConfigOverride,
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId},
     router_hint::{ROUTER_HINT_EXTRA_ARGS_KEY, RouterHint},
-    scheduling::{ClassifierError, RequestLifecycle},
+    scheduling::{AbortCause, RequestLifecycle},
 };
 use dynamo_runtime::error::{DynamoError, ErrorType, match_error_chain};
 use serde::{Deserialize, Serialize};
@@ -209,12 +209,15 @@ impl MigrationState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .request_lifecycle
             .replace(lifecycle);
-        if replaced.is_some() {
-            tracing::warn!("Replacing an unclaimed request-classifier migration lifecycle");
+        if let Some(replaced) = replaced {
+            tracing::warn!(
+                replaced = ?replaced,
+                "Replacing an unclaimed request-classifier migration lifecycle"
+            );
         }
     }
 
-    pub(crate) fn abort_request_lifecycle(&self, error: Option<&ClassifierError>) {
+    pub(crate) fn abort_request_lifecycle(&self, error: Option<&AbortCause>) {
         let Some(mut lifecycle) = self.take_request_lifecycle() else {
             return;
         };
@@ -224,7 +227,7 @@ impl MigrationState {
 
 /// Owned abort payload for classifier lifecycle events: the typed
 /// [`DynamoError`] from the chain when one exists, else the rendered message.
-pub(crate) fn owned_abort_error(error: &ClassifierError) -> Arc<ClassifierError> {
+pub(crate) fn owned_abort_error(error: &AbortCause) -> Arc<AbortCause> {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = cause {
         if let Some(dynamo_error) = current.downcast_ref::<DynamoError>() {
