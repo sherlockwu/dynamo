@@ -151,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn classifier_error_response_is_sanitized() {
         let response = SelectionError::Scheduler(KvSchedulerError::RequestClassifierFailed(
-            Box::new(PrivateClassifierError),
+            std::sync::Arc::new(PrivateClassifierError),
         ))
         .into_response();
 

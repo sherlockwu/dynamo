@@ -1773,8 +1773,10 @@ mod metric_worker_type_tests {
             Some(config),
             load_threshold_config,
             None,
-            None,
-            None,
+            RouterPluginFactories {
+                worker_selection: None,
+                request_classifier: None,
+            },
         )
         .await
         .unwrap();

@@ -38,7 +38,9 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
 };
 
-use dynamo_kv_router::scheduling::{RequestClassifierFactory, RequestClassifierRegistry};
+use dynamo_kv_router::scheduling::RequestClassifierFactory;
+#[cfg(feature = "custom-policy")]
+use dynamo_kv_router::scheduling::RequestClassifierRegistry;
 #[cfg(any(feature = "custom-policy", feature = "select-service"))]
 use dynamo_kv_router::services::selection::WorkerSelectionPolicyRegistry;
 use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicyFactory};
