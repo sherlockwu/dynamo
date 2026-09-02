@@ -65,7 +65,11 @@ from dynamo.trtllm.constants import DisaggregationMode, Modality
 from dynamo.trtllm.engine import Backend, TensorRTLLMEngine, get_llm_engine
 from dynamo.trtllm.health_check import TrtllmHealthCheckPayload
 from dynamo.trtllm.multimodal_processor import MultimodalRequestProcessor
-from dynamo.trtllm.publisher import DYNAMO_COMPONENT_REGISTRY, get_publisher
+from dynamo.trtllm.publisher import (
+    DYNAMO_COMPONENT_REGISTRY,
+    KvEventPublicationMode,
+    get_publisher,
+)
 from dynamo.trtllm.request_handlers.handlers import (
     RequestHandlerConfig,
     RequestHandlerFactory,
@@ -91,10 +95,10 @@ SPEC_DECODE_RUNTIME_KEY = "spec_decode"
 _MM_ROUTING_MODEL_TYPES = frozenset({"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "kimi_k25"})
 
 
-def _resolve_native_kv_events_config(
+def _resolve_streaming_kv_events_config(
     engine_args: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    """Resolve the native TRT-LLM ZMQ subscriber configuration."""
+    """Resolve TensorRT-LLM's streaming ZMQ event-manager configuration."""
     raw_kv_cache_config = engine_args.get("kv_cache_config")
     if raw_kv_cache_config is None:
         return None
@@ -127,7 +131,7 @@ def _resolve_native_kv_events_config(
     if not enabled or publisher == "null":
         return None
     if publisher != "zmq":
-        raise ValueError(f"Unsupported native KV event publisher: {publisher!r}")
+        raise ValueError(f"Unsupported streaming KV event publisher: {publisher!r}")
     endpoint = config.get("endpoint", "tcp://*:5557")
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError("Native KV event endpoint must be a non-empty string")
@@ -452,13 +456,22 @@ async def init_llm_worker(
         arg_map.get("return_perf_metrics", False)
         or arg_map.get("enable_iter_perf_stats", False)
     )
-    native_kv_events_config = _resolve_native_kv_events_config(arg_map)
+    streaming_kv_events_config = _resolve_streaming_kv_events_config(arg_map)
+    kv_event_publication_mode = (
+        KvEventPublicationMode.STREAMING
+        if streaming_kv_events_config is not None
+        else (
+            KvEventPublicationMode.POLLING
+            if config.publish_events_and_metrics
+            else KvEventPublicationMode.DISABLED
+        )
+    )
 
     _sync_config_from_engine_args(config, arg_map)
     _strip_postprocess_workers(arg_map)
 
     event_buffer_max_size = 0
-    if config.publish_events_and_metrics:
+    if kv_event_publication_mode is KvEventPublicationMode.POLLING:
         # 'event_buffer_max_size' is required to enable TRTLLM to publish kv cache events.
         # Add it to kv_cache_config while preserving all settings from YAML
         current_kv_config = arg_map["kv_cache_config"]
@@ -522,7 +535,10 @@ async def init_llm_worker(
             should_enable_consolidator,
         )
 
-        if config.publish_events_and_metrics and should_enable_consolidator(arg_map):
+        if (
+            kv_event_publication_mode is KvEventPublicationMode.POLLING
+            and should_enable_consolidator(arg_map)
+        ):
             # get_consolidator_endpoints returns (trtllm_bind_endpoint, output_bind_endpoint, output_connect_endpoint)
             consolidator_endpoints = get_consolidator_endpoints()
             trtllm_zmq_bind_endpoint = consolidator_endpoints[0]  # TRTLLM bind endpoint
@@ -774,7 +790,7 @@ async def init_llm_worker(
             and config.disaggregation_mode != DisaggregationMode.DECODE
         )
         runtime_config.kv_event_publishing_enabled = bool(
-            config.publish_events_and_metrics or native_kv_events_config is not None
+            kv_event_publication_mode is not KvEventPublicationMode.DISABLED
         )
         # Set data_parallel_size for attention DP mode
         # This enables the router's scheduler to correctly iterate over all dp_ranks
@@ -965,13 +981,12 @@ async def init_llm_worker(
         ).to_dict()
 
         publisher_enabled = bool(
-            config.publish_events_and_metrics
-            or native_kv_events_config is not None
+            kv_event_publication_mode is not KvEventPublicationMode.DISABLED
             or perf_metrics_enabled
         )
         if publisher_enabled:
-            # Initialize the metrics publisher and either the legacy polling
-            # path or native direct-ZMQ subscribers.
+            # Initialize metrics plus either polling publication or direct
+            # subscription to TensorRT-LLM's streaming ZMQ event manager.
             # Use model as fallback if served_model_name is not provided
             model_name_for_metrics = config.served_model_name or config.model
             metrics_labels = [
@@ -988,7 +1003,10 @@ async def init_llm_worker(
             # Create worker-side publisher for consolidated events if consolidator is enabled
             # This subscribes to consolidator's ZMQ output and publishes to NATS with worker_id
             consolidator_publisher = None
-            if config.publish_events_and_metrics and consolidator_output_endpoint:
+            if (
+                kv_event_publication_mode is KvEventPublicationMode.POLLING
+                and consolidator_output_endpoint
+            ):
                 # Use the connect endpoint directly (already provided by get_consolidator_endpoints)
                 consolidator_publisher = KvEventPublisher(
                     endpoint=endpoint,
@@ -1018,9 +1036,9 @@ async def init_llm_worker(
                 metrics_collector=metrics_collector,
                 kv_state_endpoint=config.kv_state_endpoint,
                 image_token_id=image_token_id,
-                native_kv_events_config=native_kv_events_config,
-                native_kv_events_gpus_per_node=gpus_per_node,
-                publish_legacy_kv_events=config.publish_events_and_metrics,
+                kv_event_publication_mode=kv_event_publication_mode,
+                streaming_kv_events_config=streaming_kv_events_config,
+                streaming_kv_events_gpus_per_node=gpus_per_node,
             ) as publisher:
                 handler_config.publisher = publisher
                 handler = RequestHandlerFactory().get_request_handler(handler_config)

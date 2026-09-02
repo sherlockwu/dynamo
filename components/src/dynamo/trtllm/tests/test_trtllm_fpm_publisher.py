@@ -312,9 +312,9 @@ def _build_publisher_stub(monkeypatch, *, attention_dp_size: int, fpm_enabled: b
     pub.metrics_collector = None
     pub.kv_state_endpoint = None
     pub.image_token_id = None
-    pub.native_kv_events_config = None
-    pub.native_kv_events_gpus_per_node = None
-    pub.publish_legacy_kv_events = True
+    pub.kv_event_publication_mode = publisher_mod.KvEventPublicationMode.POLLING
+    pub.streaming_kv_events_config = None
+    pub.streaming_kv_events_gpus_per_node = None
     pub.attention_dp_size = attention_dp_size
     pub.fpm_enabled = fpm_enabled
     pub.processing_initial_created_events = True
@@ -358,7 +358,29 @@ def _build_publisher_stub(monkeypatch, *, attention_dp_size: int, fpm_enabled: b
     return pub, publisher_mod, fake_fpm_cls
 
 
-def test_native_kv_events_create_direct_subscribers_without_engine_polling(
+def test_polling_kv_events_start_engine_polling(monkeypatch):
+    """The buffered get_kv_cache_events() path remains available."""
+    pub, _module, _ = _build_publisher_stub(
+        monkeypatch, attention_dp_size=1, fpm_enabled=True
+    )
+
+    pub.initialize()
+
+    pub._init_publish_kv_cache_events_thread.assert_called_once()
+
+
+def test_disabled_kv_events_do_not_start_engine_polling(monkeypatch):
+    pub, _module, _ = _build_publisher_stub(
+        monkeypatch, attention_dp_size=1, fpm_enabled=True
+    )
+    pub.kv_event_publication_mode = publisher_mod.KvEventPublicationMode.DISABLED
+
+    pub.initialize()
+
+    pub._init_publish_kv_cache_events_thread.assert_not_called()
+
+
+def test_streaming_kv_events_create_direct_subscribers_without_engine_polling(
     monkeypatch,
 ):
     """Native mode must subscribe to each rank's vLLM wire stream without
@@ -366,11 +388,12 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
     pub, module, _ = _build_publisher_stub(
         monkeypatch, attention_dp_size=2, fpm_enabled=True
     )
-    pub.native_kv_events_config = {
+    pub.kv_event_publication_mode = publisher_mod.KvEventPublicationMode.STREAMING
+    pub.streaming_kv_events_config = {
         "endpoint": "tcp://*:5557",
         "topic": "kv-events",
     }
-    pub.native_kv_events_gpus_per_node = 1
+    pub.streaming_kv_events_gpus_per_node = 1
     monkeypatch.setenv("DYN_TRTLLM_KV_EVENT_HOSTS", "worker01,worker02")
     monkeypatch.setenv("SLURM_STEP_NODELIST", "wrong[01-02]")
 
@@ -387,16 +410,17 @@ def test_native_kv_events_create_direct_subscribers_without_engine_polling(
     assert pub.publish_kv_cache_events_thread is None
 
 
-def test_native_kv_events_fall_back_to_slurm_hosts_for_multinode(monkeypatch):
+def test_streaming_kv_events_fall_back_to_slurm_hosts_for_multinode(monkeypatch):
     """Slurm allocation metadata remains supported without explicit hosts."""
     pub, _module, _ = _build_publisher_stub(
         monkeypatch, attention_dp_size=2, fpm_enabled=True
     )
-    pub.native_kv_events_config = {
+    pub.kv_event_publication_mode = publisher_mod.KvEventPublicationMode.STREAMING
+    pub.streaming_kv_events_config = {
         "endpoint": "tcp://*:5557",
         "topic": "",
     }
-    pub.native_kv_events_gpus_per_node = 1
+    pub.streaming_kv_events_gpus_per_node = 1
     monkeypatch.delenv("DYN_TRTLLM_KV_EVENT_HOSTS", raising=False)
     monkeypatch.setenv("SLURM_STEP_NODELIST", "worker[01-02]")
 
@@ -409,16 +433,17 @@ def test_native_kv_events_fall_back_to_slurm_hosts_for_multinode(monkeypatch):
     ]
 
 
-def test_native_kv_events_require_hosts_for_multinode(monkeypatch):
+def test_streaming_kv_events_require_hosts_for_multinode(monkeypatch):
     """Multi-node discovery must fail without explicit or Slurm host metadata."""
     pub, _module, _ = _build_publisher_stub(
         monkeypatch, attention_dp_size=2, fpm_enabled=True
     )
-    pub.native_kv_events_config = {
+    pub.kv_event_publication_mode = publisher_mod.KvEventPublicationMode.STREAMING
+    pub.streaming_kv_events_config = {
         "endpoint": "tcp://*:5557",
         "topic": "",
     }
-    pub.native_kv_events_gpus_per_node = 1
+    pub.streaming_kv_events_gpus_per_node = 1
     monkeypatch.delenv("DYN_TRTLLM_KV_EVENT_HOSTS", raising=False)
     monkeypatch.delenv("SLURM_STEP_NODELIST", raising=False)
 
@@ -436,14 +461,14 @@ def test_native_kv_events_require_hosts_for_multinode(monkeypatch):
         ("tcp://127.0.0.1:5557", 2, "tcp://127.0.0.1:5559"),
     ],
 )
-def test_native_kv_event_endpoint_offset_matches_trtllm_streaming_manager(
+def test_streaming_kv_event_endpoint_offset_matches_trtllm_streaming_manager(
     endpoint, rank, expected
 ):
     assert publisher_mod._offset_endpoint_port(endpoint, rank) == expected
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://host", "tcp://host:0", "udp://host:5557"])
-def test_native_kv_event_endpoint_offset_rejects_invalid_endpoint(endpoint):
+def test_streaming_kv_event_endpoint_offset_rejects_invalid_endpoint(endpoint):
     with pytest.raises(ValueError):
         publisher_mod._offset_endpoint_port(endpoint, 1)
 
