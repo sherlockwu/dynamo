@@ -202,7 +202,7 @@ impl AnthropicStreamConverter {
             let repaired_input = repair
                 .then(|| super::types::tool_use_input(&tool_call.name, &raw, true))
                 .flatten();
-            if !arguments_are_valid && !truncated {
+            if !arguments_are_valid && repaired_input.is_none() {
                 continue;
             }
             let emitted_id = new_tool_use_id();
@@ -1492,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn test_later_incomplete_identity_does_not_repair_an_earlier_call() {
+    fn test_later_incomplete_identity_does_not_emit_an_earlier_malformed_call() {
         let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
         conv.process_chunk_tagged(&tool_call_chunk(
             0,
@@ -1507,17 +1507,10 @@ mod tests {
 
         assert!(events.iter().all(|event| !matches!(
             &event.data,
-            AnthropicStreamEvent::ContentBlockDelta {
-                delta: AnthropicDelta::InputJsonDelta { partial_json },
+            AnthropicStreamEvent::ContentBlockStart {
+                content_block: AnthropicResponseContentBlock::ToolUse { .. },
                 ..
-            } if partial_json.contains("done") && partial_json.contains('}')
-        )));
-        assert!(events.iter().any(|event| matches!(
-            &event.data,
-            AnthropicStreamEvent::ContentBlockDelta {
-                delta: AnthropicDelta::InputJsonDelta { partial_json },
-                ..
-            } if partial_json == r#"{"done": "cut""#
+            }
         )));
     }
 
@@ -1550,6 +1543,33 @@ mod tests {
                 "malformed {reason:?} arguments must not create an executable tool block"
             );
         }
+    }
+
+    #[test]
+    fn test_stream_suppresses_length_tool_call_without_recoverable_input() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("record_literal"),
+            Some(r#"{"label": "cut"#),
+        ));
+
+        let mut events = conv.process_chunk_tagged(&finish_chunk(FinishReason::Length));
+        events.extend(conv.emit_end_events_tagged());
+
+        assert!(events.iter().all(|event| !matches!(
+            &event.data,
+            AnthropicStreamEvent::ContentBlockStart {
+                content_block: AnthropicResponseContentBlock::ToolUse { .. },
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            AnthropicStreamEvent::MessageDelta { delta, .. }
+                if delta.stop_reason == Some(AnthropicStopReason::MaxTokens)
+        )));
     }
 
     /// Buffered tool-argument fragments must carry the usage snapshot from their
