@@ -22,6 +22,7 @@ use super::policy_config::{PolicyClassConfig, PolicyProfile};
 use super::policy_queue::{PolicyQueue, QueueMetadata, QueueSnapshot};
 use super::prefill_load::{PrefillLoadEstimator, effective_prefill_tokens};
 use super::queue_admission::WorkerPlacement;
+use super::request_classifier::ClassifyRequest;
 use super::selector::{DefaultWorkerSelector, WorkerSelectionInput, WorkerSelector};
 use super::types::{
     AdvisorySchedulingResponse, AdvisoryWorkerLoad, AttemptId, KvSchedulerError,
@@ -778,6 +779,7 @@ impl<
             block_hashes,
             lease,
             None,
+            None,
             StdInstant::now(),
         )
         .await
@@ -789,7 +791,8 @@ impl<
         block_hashes: Option<Vec<LocalBlockHash>>,
         lease: Option<Box<RequestLifecycleLease>>,
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
-        _ingress_at: StdInstant,
+        classified_request: Option<ClassifyRequest>,
+        ingress_at: StdInstant,
     ) -> Option<Box<RequestLifecycleLease>> {
         self.record_received();
         if self.queueing_enabled && lease.is_none() && request.mode.lifecycle_request_id().is_some()
@@ -800,7 +803,20 @@ impl<
             return None;
         }
 
-        let queue_metadata = self.default_queue_metadata(&request);
+        let queue_metadata = match classified_request {
+            Some(classified) => self.validate_classification(&request, classified, ingress_at),
+            None => Ok(self.default_queue_metadata(&request)),
+        };
+        let queue_metadata = match queue_metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if matches!(error, KvSchedulerError::DueTimeExpired) {
+                    self.record_due_time_passed();
+                }
+                request.respond(Err(error));
+                return None;
+            }
+        };
 
         let eligibility = request.eligibility();
 
@@ -836,6 +852,39 @@ impl<
         }
     }
 
+    /// Classification uses `request.isl_tokens` — the routing-token basis the
+    /// queue's bucketing, limits, and DRR cost already use — so a pass-through
+    /// classifier is behavior-identical to no classifier.
+    pub(crate) fn classify_request(
+        &self,
+        request: &super::types::ScheduleRequest,
+        ingress_at: StdInstant,
+    ) -> ClassifyRequest {
+        let workers = self.workers_with_configs.borrow();
+        let cached_tokens = super::types::best_cached_tokens(
+            &request.overlap.effective_cached_tokens,
+            RoutingEligibility::new(
+                request.allowed_worker_ids.as_ref(),
+                None,
+                request.pinned_worker,
+                &request.routing_constraints,
+            ),
+            &workers,
+        );
+        let mut classification =
+            ClassifyRequest::with_timing(request.isl_tokens, cached_tokens, ingress_at);
+        if let Some(request_id) = request.mode.request_id() {
+            classification = classification.with_request_id(request_id);
+        }
+        if let Some(policy_class) = request.policy_class.as_deref() {
+            classification = classification.with_initial_policy_class(policy_class);
+        }
+        if let Some(session_context) = request.session_context.clone() {
+            classification = classification.with_session_context(session_context);
+        }
+        classification
+    }
+
     fn default_queue_metadata(&self, request: &SchedulingRequest) -> QueueMetadata {
         let workers = self.workers_with_configs.borrow();
         let snapshot = QueueSnapshot::new(
@@ -851,6 +900,56 @@ impl<
             due_at: None,
             arrival_offset_secs: self.start_time.elapsed().as_secs_f64(),
         }
+    }
+
+    fn validate_classification(
+        &self,
+        request: &SchedulingRequest,
+        classified_request: ClassifyRequest,
+        ingress_at: StdInstant,
+    ) -> Result<QueueMetadata, KvSchedulerError> {
+        let (policy_class, due_at, scheduling_cost_tokens, initial_cached_tokens) =
+            classified_request.into_queue_inputs();
+
+        if scheduling_cost_tokens == Some(0) {
+            return Err(KvSchedulerError::InvalidClassificationMetadata(
+                "scheduling cost must be greater than zero".to_string(),
+            ));
+        }
+        if due_at.is_some_and(|due_at| due_at <= StdInstant::now()) {
+            return Err(KvSchedulerError::DueTimeExpired);
+        }
+
+        // Same token basis as `default_queue_metadata`: the queue keys every
+        // count off the routing tokens regardless of classification.
+        let mut snapshot = QueueSnapshot::new(request.isl_tokens, initial_cached_tokens);
+        let class_index_override = policy_class
+            .map(|policy_class| {
+                self.profile
+                    .resolve_class_index_strict(&policy_class, snapshot.uncached_tokens)
+                    .ok_or_else(|| {
+                        KvSchedulerError::InvalidClassificationMetadata(format!(
+                            "unknown policy class {policy_class:?}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let class_index = class_index_override.unwrap_or_else(|| {
+            self.profile
+                .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens)
+        });
+        if let Some(cost) = scheduling_cost_tokens {
+            snapshot.scheduling_cost_tokens = cost;
+        }
+
+        Ok(QueueMetadata {
+            class_index,
+            snapshot,
+            due_at,
+            arrival_offset_secs: ingress_at
+                .saturating_duration_since(self.start_time)
+                .as_secs_f64(),
+        })
     }
 
     pub(crate) fn new_request_lifecycle_lease(
@@ -872,6 +971,10 @@ impl<
 
     pub(crate) fn record_received(&self) {
         self.admission_counters.record_received();
+    }
+
+    pub(crate) fn record_due_time_passed(&self) {
+        self.admission_counters.record_due_time_passed();
     }
 
     #[cfg(test)]
@@ -2417,23 +2520,216 @@ mod tests {
         (req, rx)
     }
 
+    fn classify_source(request: &SchedulingRequest) -> super::super::types::ScheduleRequest {
+        super::super::types::ScheduleRequest {
+            mode: request.mode.clone(),
+            token_seq: request.token_seq.clone(),
+            block_hashes: None,
+            isl_tokens: request.isl_tokens,
+            lora_name: request.lora_name.clone(),
+            expected_output_tokens: request.expected_output_tokens,
+            pinned_worker: request.pinned_worker,
+            allowed_worker_ids: request.allowed_worker_ids.clone(),
+            routing_constraints: request.routing_constraints.clone(),
+            router_config_override: request.router_config_override.clone(),
+            priority_jump: request.priority_jump,
+            strict_priority: request.strict_priority,
+            policy_class: request.policy_class.clone(),
+            session_context: request.session_context.clone(),
+            affinity_target: request.affinity_target,
+            overlap: request.overlap.clone(),
+            router_hint_candidates: request.router_hint_candidates.clone(),
+            retain_router_hint_chain: request.retain_router_hint_chain,
+            shared_cache_hits: request.shared_cache_hits.clone(),
+        }
+    }
+
     #[tokio::test]
-    async fn admission_counters_record_every_received_request() {
+    async fn classifier_overrides_are_validated_before_order() {
+        let profile = policy_profile(
+            r#"
+default_policy_family: latency
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: cached
+  - min_tokens: 32
+    bucket: uncached
+policy_classes:
+  - name: latency_cached
+    policy_family: latency
+    cache_bucket: cached
+    quantum: 1
+  - name: latency_uncached
+    policy_family: latency
+    cache_bucket: uncached
+    quantum: 1
+  - name: bulk_cached
+    policy_family: bulk
+    cache_bucket: cached
+    quantum: 1
+  - name: bulk_uncached
+    policy_family: bulk
+    cache_bucket: uncached
+    quantum: 1
+  - name: custom_priority
+    quantum: 1
+"#,
+        );
+        let (queue, _slots) = make_queue_with_profile(1, 16, 64, profile);
+        let (mut request, _rx) = make_request("classified", 16);
+        request.policy_class = Some("latency".to_string());
+        let ingress_at = StdInstant::now();
+        let due_at = ingress_at + Duration::from_secs(20);
+        let mut classified = queue.classify_request(&classify_source(&request), ingress_at);
+        assert_eq!(classified.ingress_at(), ingress_at);
+        classified.set_policy_class("bulk");
+        classified.set_due_at(due_at);
+        classified.set_scheduling_cost_tokens(7);
+
+        let metadata = queue
+            .validate_classification(&request, classified, ingress_at)
+            .unwrap();
+        assert_eq!(
+            queue.profile.class(metadata.class_index).name,
+            "bulk_cached"
+        );
+        assert_eq!(metadata.snapshot.scheduling_cost_tokens, 7);
+        assert_eq!(metadata.due_at, Some(due_at));
+        let mut order = PolicyQueue::new(queue.profile.clone());
+        order
+            .enqueue_with_due_at(
+                metadata,
+                1,
+                request.priority_jump,
+                request.strict_priority,
+                WorkerPlacement::Any,
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            order
+                .pop_next(|_, _, _| true)
+                .unwrap()
+                .snapshot()
+                .scheduling_cost_tokens,
+            7
+        );
+
+        let mut invalid = queue.classify_request(&classify_source(&request), ingress_at);
+        invalid.set_policy_class("missing");
+        assert!(matches!(
+            queue.validate_classification(&request, invalid, ingress_at),
+            Err(KvSchedulerError::InvalidClassificationMetadata(_))
+        ));
+
+        let mut physical = queue.classify_request(&classify_source(&request), ingress_at);
+        physical.set_policy_class("latency_cached");
+        assert!(matches!(
+            queue.validate_classification(&request, physical, ingress_at),
+            Err(KvSchedulerError::InvalidClassificationMetadata(_))
+        ));
+
+        let mut zero_cost = queue.classify_request(&classify_source(&request), ingress_at);
+        zero_cost.set_scheduling_cost_tokens(0);
+        assert!(matches!(
+            queue.validate_classification(&request, zero_cost, ingress_at),
+            Err(KvSchedulerError::InvalidClassificationMetadata(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_classified_request_expires_without_an_external_update() {
         let (queue, _slots) = make_queue(1, 16, 64, Some(0.0));
         let (active, active_rx) = make_request("active", 64);
         queue.enqueue(active).await;
         active_rx.await.unwrap().unwrap();
 
-        let (queued, _queued_rx) = make_request("queued", 64);
-        queue.enqueue(queued).await;
+        let (queued, queued_rx) = make_request("due", 64);
+        let ingress_at = StdInstant::now();
+        let mut classified = queue.classify_request(&classify_source(&queued), ingress_at);
+        classified.set_due_at(ingress_at + Duration::from_secs(1));
+        queue
+            .enqueue_admitted_with_block_hashes_and_lease(
+                queued,
+                None,
+                None,
+                None,
+                Some(classified),
+                ingress_at,
+            )
+            .await;
         assert_eq!(queue.pending_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            queued_rx.await.unwrap(),
+            Err(KvSchedulerError::DueTimeExpired)
+        ));
+        assert_eq!(queue.pending_count(), 0);
         assert_eq!(
             queue.admission_counters(),
             AdmissionCounterSnapshot {
                 received: 2,
-                due_time_passed: 0,
+                due_time_passed: 1,
             }
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queued_classified_request_expires_during_overlap_refresh() {
+        let block_size = 16;
+        let isl = 64;
+        let refresher = Arc::new(BlockingRefresher::new(RefreshedOverlap::default()));
+        let (queue, slots) = make_queue_with_blocking_refresher(
+            1,
+            block_size,
+            isl,
+            Some(0.0),
+            Arc::clone(&refresher),
+            ADMISSION_CHANNEL_CAPACITY,
+        );
+
+        let (active, active_rx) = make_request("active", isl);
+        queue.enqueue(active).await;
+        active_rx.await.unwrap().unwrap();
+
+        let (queued, queued_rx) = make_request("due-during-refresh", isl);
+        let ingress_at = StdInstant::now();
+        let mut classified = queue.classify_request(&classify_source(&queued), ingress_at);
+        classified.set_due_at(ingress_at + Duration::from_secs(12));
+        queue
+            .enqueue_admitted_with_block_hashes_and_lease(
+                queued,
+                Some(vec![LocalBlockHash(42)]),
+                None,
+                None,
+                Some(classified),
+                ingress_at,
+            )
+            .await;
+        assert_eq!(queue.pending_count(), 1);
+
+        slots
+            .mark_prefill_completed(&"active".to_string(), decay_now())
+            .unwrap();
+        slots.free(&"active".to_string(), decay_now()).unwrap();
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        let update = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.update().await })
+        };
+        refresher.wait_for_calls(1).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        refresher.release_one();
+        update.await.unwrap();
+
+        assert!(matches!(
+            queued_rx.await.unwrap(),
+            Err(KvSchedulerError::DueTimeExpired)
+        ));
+        assert_eq!(queue.pending_count(), 0);
+        slots.assert_completely_drained(decay_now());
     }
 
     #[tokio::test]
